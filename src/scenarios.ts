@@ -63,4 +63,23 @@ export const DEMOS: Demo[] = [
       { at: 10, lineId: 'L', kind: 'lower' },
     ],
   },
+  {
+    name: '切模式 + 同 tick 调级',
+    description:
+      'A 先屏蔽并边沿触发，t3 改为电平并解除屏蔽：旧边沿待处理位仍执行一次；同 tick 把运行中的 B 从 p3 降到 p1，等待的 C(p2) 在调级当 tick 不抢占（门槛冻结），B 跑完后依次执行 A、C。',
+    lines: [
+      { id: 'A', priority: 2, mode: 'edge', handlerTicks: 2 },
+      { id: 'B', priority: 3, mode: 'edge', handlerTicks: 4 },
+      { id: 'C', priority: 2, mode: 'edge', handlerTicks: 1 },
+    ],
+    events: [
+      { at: 1, lineId: 'A', kind: 'mask' },
+      { at: 1, lineId: 'A', kind: 'raise' },
+      { at: 2, lineId: 'B', kind: 'raise' },
+      { at: 2, lineId: 'C', kind: 'raise' },
+      { at: 3, lineId: 'A', kind: 'setMode', mode: 'level' },
+      { at: 3, lineId: 'A', kind: 'unmask' },
+      { at: 3, lineId: 'B', kind: 'setPriority', priority: 1 },
+    ],
+  },
 ];

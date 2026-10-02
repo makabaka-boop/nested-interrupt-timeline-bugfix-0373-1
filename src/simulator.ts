@@ -2,19 +2,31 @@
  * 中断控制器回放核心（不连接真实硬件）。
  *
  * 每个 tick 的固定顺序：
- *   阶段 A：应用该 tick 的外部事件（raise / lower / mask / unmask）
+ *   阶段 A：应用该 tick 的外部事件（同一 tick 多事件严格按输入顺序生效）
  *   阶段 B：处理「上一 tick」执行到最后一个 tick 的处理程序完成
  *   阶段 C：调度 —— 栈空时取优先级最高的可运行待处理线进入；
  *           栈非空时，仅严格更高优先级的待处理线可抢占，
  *           同优先级按待处理时刻(since)、ID 排队等待。
  *   阶段 D：栈顶处理程序执行 1 tick（被抢占者此 tick 不消耗 handlerTicks）。
  *
- * 语义要点：
- *  - 边沿线：屏蔽期间置起的待处理位保留，重复触发合并（hits 累加）；
- *    处理程序运行期间再次触发也会置一个待处理位（可嵌套重入）。
- *  - 电平线：输入保持有效且未屏蔽时即为可运行；处理完成后电平仍有效
- *    则再次进入；屏蔽只阻止调度，不撤销输入电平。
- *  - 屏蔽正在运行的线不会停止其当前处理程序；屏蔽只影响调度资格。
+ * 抢占门槛：
+ *  - 等待者始终按「当前」优先级参与排序；
+ *  - 栈中帧的抢占门槛在进入时冻结（FrameInfo.entryPriority），运行期间
+ *    setPriority 不会改变它，也不会让等待线在调级当 tick 抢占（处理程序
+ *    一旦开始就跑到让出点：完成或被真正更高优先级的新等待者抢占）。
+ *
+ * 待处理位语义（按「来源 origin」而非「当前模式」解释）：
+ *  - edge 来源（含切到电平后保留下来的旧边沿位）：一次性位，屏蔽期保留、
+ *    重复触发合并（hits 累加）；只能被调度消费，lower 对它无效。
+ *  - level 来源：由当前物理电平派生；电平撤销(lower)或屏蔽(mask)即移除，
+ *    处理完成时电平仍有效则重新置位（电平重入）。
+ *
+ * 模式切换（setMode）不重放历史、不合成边沿，也不清空已有待处理位：
+ *  - edge→level：旧 edge 位保留（仍会被执行一次）；物理电平不变。
+ *  - level→edge：由电平派生的 level 位保留为一次性位；物理电平不变，
+ *    此后只有新的 raise 边沿才会再置位。
+ *
+ * 屏蔽正在运行的线不会停止其当前处理程序；屏蔽只影响后续调度资格。
  */
 
 import {
@@ -69,9 +81,23 @@ export function validateInput(
     if (ev.kind === 'setMode' && ev.mode !== 'edge' && ev.mode !== 'level') {
       errors.push(`tick ${ev.at} 的模式调整必须指定 edge 或 level：${ev.lineId}`);
     }
-    const cfg = lines.find((l) => l.id === ev.lineId);
-    if (cfg?.mode === 'edge' && ev.kind === 'lower') {
-      warnings.push(`tick ${ev.at}：边沿线 ${ev.lineId} 的 lower 事件无意义，已忽略。`);
+  }
+  // lower 是否有意义取决于「事件发生当 tick（阶段 A 应用时）的当前模式」，
+  // 因此按 tick 与输入顺序模拟一遍模式变化来给告警，而不是只看初始模式。
+  const modeAt = new Map(lines.map((l) => [l.id, l.mode]));
+  const byTick = new Map<number, ScheduledEvent[]>();
+  for (const ev of events) {
+    const list = byTick.get(ev.at) ?? [];
+    list.push(ev);
+    byTick.set(ev.at, list);
+  }
+  for (const t of [...byTick.keys()].sort((a, b) => a - b)) {
+    for (const ev of byTick.get(t)!) {
+      if (ev.kind === 'setMode' && (ev.mode === 'edge' || ev.mode === 'level')) {
+        modeAt.set(ev.lineId, ev.mode);
+      } else if (ev.kind === 'lower' && modeAt.get(ev.lineId) === 'edge') {
+        warnings.push(`tick ${ev.at}：线 ${ev.lineId} 当前为边沿模式，lower 事件无意义，已忽略。`);
+      }
     }
   }
   return { errors, warnings };
@@ -79,9 +105,9 @@ export function validateInput(
 
 interface InternalState {
   cfg: Map<string, LineConfig>;
-  /** 待处理位：edge 位 / level 可运行位。 */
+  /** 待处理位：origin=edge 的一次性位 / origin=level 的电平派站位。 */
   pending: PendingInfo[];
-  /** 当前输入电平为高的 level 线。 */
+  /** 当前物理输入电平为高的线（与当前模式无关，切模式不改变它）。 */
   levelAsserted: Set<string>;
   masked: Set<string>;
   /** 执行栈，栈顶在数组末尾。 */
@@ -93,7 +119,6 @@ interface InternalState {
 /** 逐 tick 推进器：同一状态机既支持单步也支持整批回放。 */
 export class ReplayController {
   private state: InternalState;
-  private entryPriority = new Map<string, number>();
   private eventsByTick: Map<number, ScheduledEvent[]>;
   private lastTick = 0;
   private truncated = false;
@@ -177,66 +202,69 @@ export class ReplayController {
     switch (ev.kind) {
       case 'raise': {
         if (line.mode === 'edge') {
-          // 边沿：待处理位尚未被调度消费时（无论屏蔽、空闲还是本线正在运行），
-          // 重复触发都合并为一位，hits 累加并保留最早 since。
+          // 边沿触发：无论屏蔽、空闲还是本线正在运行，尚未消费期间重复触发
+          // 都合并为一位（edge 来源），hits 累加并保留最早 since。
           if (existing) {
             existing.hits += 1;
           } else {
-            pending.push({ lineId: line.id, since: tick, hits: 1, kind: 'edge' });
+            pending.push({ lineId: line.id, since: tick, hits: 1, origin: 'edge' });
           }
         } else {
-          // 电平：置高输入。屏蔽 / 正在运行都不丢失输入状态，
-          // 但只有未屏蔽且未运行时才立即可调度。
+          // 电平拉高：记录物理电平；未屏蔽且未运行时派生一个 level 位。
+          // 屏蔽 / 正在运行都不丢失物理电平。
           levelAsserted.add(line.id);
           if (!masked.has(line.id) && !runningIds.has(line.id) && !existing) {
-            pending.push({ lineId: line.id, since: tick, hits: 1, kind: 'level' });
+            pending.push({ lineId: line.id, since: tick, hits: 1, origin: 'level' });
           }
         }
         break;
       }
       case 'lower': {
         if (line.mode === 'level') {
+          // 撤销物理电平：只移除由电平派生（origin=level）的待处理位；
+          // 切到电平后保留下来的旧 edge 一次性位不受 lower 影响。
           levelAsserted.delete(line.id);
-          // 还没被调度消费的 level 待处理位随撤销而消失；
-          // 已在执行栈中的处理程序不受影响（屏蔽/撤销不杀正在运行的程序）。
           if (!runningIds.has(line.id)) {
-            const idx = pending.findIndex((p) => p.lineId === line.id && p.kind === 'level');
+            const idx = pending.findIndex((p) => p.lineId === line.id && p.origin === 'level');
             if (idx >= 0) pending.splice(idx, 1);
           }
         }
-        // edge 线的 lower 在 validateInput 中已作为告警，这里直接忽略。
+        // edge 模式的 lower 在 validateInput 中已作为告警，这里直接忽略。
         break;
       }
       case 'mask': {
         masked.add(line.id);
-        // 电平位被屏蔽后立即失去调度资格并移出待处理集合，
-        // 输入电平本身不撤销（解除屏蔽时若仍有效会重新置位）。
+        // 屏蔽只撤销「电平派生」位的调度资格（物理电平保留，解除时可恢复）；
+        // edge 一次性位（含切模式遗留的旧位）在屏蔽期间保留。
         if (line.mode === 'level' && !runningIds.has(line.id)) {
-          const idx = pending.findIndex((p) => p.lineId === line.id && p.kind === 'level');
+          const idx = pending.findIndex((p) => p.lineId === line.id && p.origin === 'level');
           if (idx >= 0) pending.splice(idx, 1);
         }
-        // 边沿位按需求在屏蔽期间保留（重复触发继续合并），不动 pending。
         break;
       }
       case 'unmask': {
         masked.delete(line.id);
-        // 解除屏蔽不会合成边沿；但仍有效的电平线立即恢复可调度，
-        // since 取「当前可运行」的时刻（解除屏蔽的时刻）。
+        // 解除屏蔽不合成边沿；但若物理电平仍有效且当前是电平模式，
+        // 立即重新派生 level 位（since 取解除屏蔽的当前 tick）。
         if (
           line.mode === 'level' &&
           levelAsserted.has(line.id) &&
           !runningIds.has(line.id) &&
           !pending.some((p) => p.lineId === line.id)
         ) {
-          pending.push({ lineId: line.id, since: tick, hits: 1, kind: 'level' });
+          pending.push({ lineId: line.id, since: tick, hits: 1, origin: 'level' });
         }
         break;
       }
       case 'setPriority': {
+        // 仅影响后续调度：等待者按新优先级排序；已在栈中的帧门槛已冻结。
         cfg.set(line.id, { ...line, priority: ev.priority! });
         break;
       }
       case 'setMode': {
+        // 切换触发模式：不重放历史、不合成边沿，也不清空已有待处理位。
+        // 待处理位的 origin 保留（旧 edge 位仍执行一次；旧 level 位变为
+        // 一次性位）；物理电平保持不变。
         cfg.set(line.id, { ...line, mode: ev.mode! });
         break;
       }
@@ -285,7 +313,10 @@ export class ReplayController {
         type: 'event',
         lineId: ev.lineId,
         eventKind: ev.kind,
-        detail: `tick ${tick} 事件：${ev.lineId} ${eventLabel(ev.kind)}${ev.kind === 'setPriority' ? ` ${ev.priority}` : ''}`,
+        detail:
+          `tick ${tick} 事件：${ev.lineId} ${eventLabel(ev.kind)}` +
+          (ev.kind === 'setPriority' ? ` ${ev.priority}` : '') +
+          (ev.kind === 'setMode' ? ` ${ev.mode}` : ''),
       });
     }
 
@@ -294,7 +325,6 @@ export class ReplayController {
     if (top && top.elapsed >= top.total) {
       this.state.stack.pop()!;
       this.state.runningIds.delete(top.lineId);
-      this.entryPriority.delete(top.lineId);
       completed = { lineId: top.lineId };
       this.logs.push({
         tick,
@@ -303,7 +333,9 @@ export class ReplayController {
         detail: `tick ${tick} 完成：${top.lineId}（共 ${top.total} tick）`,
       });
 
-      // 完成后：电平仍有效 → 重新成为可运行待处理位（电平重入）。
+      // 完成后：仅当「当前」仍是电平模式且物理电平仍有效（且未屏蔽）时，
+      // 才重新派生 level 位（电平重入）。若运行期间已切成边沿，则物理电平
+      // 不会重放为边沿，不再重入。
       const cfg = this.state.cfg.get(top.lineId)!;
       if (
         cfg.mode === 'level' &&
@@ -311,7 +343,7 @@ export class ReplayController {
         !this.state.masked.has(top.lineId) &&
         !this.state.pending.some((p) => p.lineId === top.lineId)
       ) {
-        this.state.pending.push({ lineId: top.lineId, since: tick, hits: 1, kind: 'level' });
+        this.state.pending.push({ lineId: top.lineId, since: tick, hits: 1, origin: 'level' });
       }
 
       // 露出的父帧标记为「抢占结束」，本 tick 稍后可能 resume。
@@ -335,10 +367,10 @@ export class ReplayController {
       }
     } else if (
       winner &&
-      this.state.cfg.get(winner.lineId)!.priority >
-        this.entryPriority.get(currentTop.lineId)!
+      this.state.cfg.get(winner.lineId)!.priority > currentTop.entryPriority
     ) {
-      // 仅严格更高优先级可抢占当前程序；同优先级即使等待也不动。
+      // 仅严格高于「该帧进入时冻结的门槛」才可抢占；运行中调级不改变门槛，
+      // 故调级当 tick（及之后）都不会让等待者借此抢占。同优先级继续等待。
       currentTop.preempted = true;
       this.enterFrame(winner, tick);
       action = { type: 'preempt', by: winner.lineId, resumed: currentTop.lineId };
@@ -346,11 +378,10 @@ export class ReplayController {
         tick,
         type: 'preempt',
         lineId: winner.lineId,
-        detail: `tick ${tick} 抢占：${winner.lineId}（优先级 ${
+        detail: `tick ${tick} 抢占：${winner.lineId}（当前优先级 ${
           this.state.cfg.get(winner.lineId)!.priority
-        }）抢占 ${currentTop.lineId}（优先级 ${
-          this.state.cfg.get(currentTop.lineId)!.priority
-        }），同优先级候选继续等待`,
+        }）抢占 ${currentTop.lineId}（进入门槛 p${currentTop.entryPriority}；` +
+          `当前 p${this.state.cfg.get(currentTop.lineId)!.priority} 不改变门槛），同优先级候选继续等待`,
       });
     } else if (currentTop.preempted) {
       // 抢占者已完成、露出的父帧本 tick 恢复（无更高优先级再抢占）。
@@ -406,6 +437,9 @@ export class ReplayController {
       pending: this.state.pending.slice().sort(comparePending).map((p) => ({ ...p })),
       levelAsserted: [...this.state.levelAsserted].sort(),
       masked: [...this.state.masked].sort(),
+      lineStates: [...this.state.cfg.values()]
+        .map((l) => ({ lineId: l.id, priority: l.priority, mode: l.mode }))
+        .sort((a, b) => (a.lineId < b.lineId ? -1 : a.lineId > b.lineId ? 1 : 0)),
       topRemaining: execTop ? execTop.total - execTop.elapsed : null,
     };
   }
@@ -418,10 +452,12 @@ export class ReplayController {
       total: cfg.handlerTicks,
       elapsed: 0,
       enteredAt: tick,
+      // 抢占门槛与模式在进入时冻结，运行中 setPriority/setMode 不影响本帧。
+      entryPriority: cfg.priority,
+      entryMode: cfg.mode,
       preempted: false,
     });
     this.state.runningIds.add(p.lineId);
-    this.entryPriority.set(p.lineId, cfg.priority);
   }
 }
 

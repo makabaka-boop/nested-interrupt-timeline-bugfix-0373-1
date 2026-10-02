@@ -38,14 +38,25 @@ export interface ScheduledEvent {
   mode?: TriggerMode;
 }
 
+/**
+ * 待处理位的来源（语义按「来源」而非「当前模式」解释）：
+ *  - edge：由边沿触发（或切到电平后保留下来的旧边沿位）置起的一次性位，
+ *    只能被调度消费或显式清除，不因当前是电平模式就受 lower 影响；
+ *  - level：由当前有效的输入电平派生的位，电平撤销 / 屏蔽即消失。
+ * 模式切换不改变来源：边沿位切到电平仍是 edge 位（旧待处理位仍执行一次），
+ * 电平位切到边沿仍是 edge 语义的一次性位（不合成新边沿）。
+ */
+export type PendingOrigin = 'edge' | 'level';
+
 /** 内部待处理条目（待处理证据）。 */
 export interface PendingInfo {
   lineId: string;
   /** 待处理位最早置位的 tick；同优先级时先到先处理。 */
   since: number;
-  /** 合并的触发次数（边沿屏蔽期间重复触发会合并为 1 位）。 */
+  /** 合并的触发次数（边沿位在尚未被消费期间重复触发会合并为 1 位）。 */
   hits: number;
-  kind: 'edge' | 'level';
+  /** 待处理位来源；切模式后保留，用于让三视图给出一致解释。 */
+  origin: PendingOrigin;
 }
 
 /** 执行栈中的一帧。 */
@@ -57,6 +68,14 @@ export interface FrameInfo {
   elapsed: number;
   /** 本帧进入（enter）时的 tick。 */
   enteredAt: number;
+  /**
+   * 进入时该线的优先级（抢占门槛在整个处理期间冻结于此）：
+   * 运行中再 setPriority 不会改变本帧能否被抢占，也不会让等待线在调级
+   * 当 tick 抢占；等待者的优先级则始终取「当前」值参与比较。
+   */
+  entryPriority: number;
+  /** 进入时该线的触发模式（运行中切模式不影响已在跑的帧）。 */
+  entryMode: TriggerMode;
   /** 该帧之后是否已有更高优先级帧压入（用于区分 resume / continue）。 */
   preempted: boolean;
 }
@@ -76,10 +95,19 @@ export interface TraceLog {
   detail: string;
 }
 
+/** 单个 tick 结束后每条线的动态配置（三视图的唯一真相来源）。 */
+export interface LineStateInfo {
+  lineId: string;
+  /** 该 tick 结束后的当前优先级（setPriority 当 tick 即对后续调度生效）。 */
+  priority: number;
+  /** 该 tick 结束后的当前触发模式。 */
+  mode: TriggerMode;
+}
+
 /** 单个 tick 的完整快照（逐 tick 参考状态机核对的单位）。 */
 export interface TickRecord {
   tick: number;
-  /** 阶段 A 应用的事件（保持输入顺序）。 */
+  /** 阶段 A 应用的事件（保持输入顺序，含 setPriority/setMode 的取值）。 */
   eventsApplied: Array<{ lineId: string; kind: EventKind; priority?: number; mode?: TriggerMode }>;
   /** 阶段 B 的完成（本 tick 最多一个）。 */
   completed?: { lineId: string };
@@ -94,10 +122,12 @@ export interface TickRecord {
   stack: FrameInfo[];
   /** 本 tick 结束后的待处理位（已按 since、ID 排序）。 */
   pending: PendingInfo[];
-  /** 本 tick 结束后的输入电平（仅 level 线为 true 时有条目）。 */
+  /** 本 tick 结束后的输入电平（仅物理电平为高时有条目）。 */
   levelAsserted: string[];
   /** 本 tick 结束后处于屏蔽状态的线。 */
   masked: string[];
+  /** 本 tick 结束后每条线的当前优先级 / 模式（按 ID 排序）。 */
+  lineStates: LineStateInfo[];
   /** 本 tick 结束后栈顶帧剩余 tick（空闲时为 null）。 */
   topRemaining: number | null;
 }

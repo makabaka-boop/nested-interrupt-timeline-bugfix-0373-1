@@ -41,16 +41,27 @@ function validateInput(lines, events) {
     if (ev.kind === "setMode" && ev.mode !== "edge" && ev.mode !== "level") {
       errors.push(`tick ${ev.at} \u7684\u6A21\u5F0F\u8C03\u6574\u5FC5\u987B\u6307\u5B9A edge \u6216 level\uFF1A${ev.lineId}`);
     }
-    const cfg = lines.find((l) => l.id === ev.lineId);
-    if (cfg?.mode === "edge" && ev.kind === "lower") {
-      warnings.push(`tick ${ev.at}\uFF1A\u8FB9\u6CBF\u7EBF ${ev.lineId} \u7684 lower \u4E8B\u4EF6\u65E0\u610F\u4E49\uFF0C\u5DF2\u5FFD\u7565\u3002`);
+  }
+  const modeAt = new Map(lines.map((l) => [l.id, l.mode]));
+  const byTick = /* @__PURE__ */ new Map();
+  for (const ev of events) {
+    const list = byTick.get(ev.at) ?? [];
+    list.push(ev);
+    byTick.set(ev.at, list);
+  }
+  for (const t of [...byTick.keys()].sort((a, b) => a - b)) {
+    for (const ev of byTick.get(t)) {
+      if (ev.kind === "setMode" && (ev.mode === "edge" || ev.mode === "level")) {
+        modeAt.set(ev.lineId, ev.mode);
+      } else if (ev.kind === "lower" && modeAt.get(ev.lineId) === "edge") {
+        warnings.push(`tick ${ev.at}\uFF1A\u7EBF ${ev.lineId} \u5F53\u524D\u4E3A\u8FB9\u6CBF\u6A21\u5F0F\uFF0Clower \u4E8B\u4EF6\u65E0\u610F\u4E49\uFF0C\u5DF2\u5FFD\u7565\u3002`);
+      }
     }
   }
   return { errors, warnings };
 }
 var ReplayController = class {
   constructor(lines, events, warnings = []) {
-    this.entryPriority = /* @__PURE__ */ new Map();
     this.lastTick = 0;
     this.truncated = false;
     this.logs = [];
@@ -124,12 +135,12 @@ var ReplayController = class {
           if (existing) {
             existing.hits += 1;
           } else {
-            pending.push({ lineId: line.id, since: tick, hits: 1, kind: "edge" });
+            pending.push({ lineId: line.id, since: tick, hits: 1, origin: "edge" });
           }
         } else {
           levelAsserted.add(line.id);
           if (!masked.has(line.id) && !runningIds.has(line.id) && !existing) {
-            pending.push({ lineId: line.id, since: tick, hits: 1, kind: "level" });
+            pending.push({ lineId: line.id, since: tick, hits: 1, origin: "level" });
           }
         }
         break;
@@ -138,7 +149,7 @@ var ReplayController = class {
         if (line.mode === "level") {
           levelAsserted.delete(line.id);
           if (!runningIds.has(line.id)) {
-            const idx = pending.findIndex((p) => p.lineId === line.id && p.kind === "level");
+            const idx = pending.findIndex((p) => p.lineId === line.id && p.origin === "level");
             if (idx >= 0) pending.splice(idx, 1);
           }
         }
@@ -147,7 +158,7 @@ var ReplayController = class {
       case "mask": {
         masked.add(line.id);
         if (line.mode === "level" && !runningIds.has(line.id)) {
-          const idx = pending.findIndex((p) => p.lineId === line.id && p.kind === "level");
+          const idx = pending.findIndex((p) => p.lineId === line.id && p.origin === "level");
           if (idx >= 0) pending.splice(idx, 1);
         }
         break;
@@ -155,7 +166,7 @@ var ReplayController = class {
       case "unmask": {
         masked.delete(line.id);
         if (line.mode === "level" && levelAsserted.has(line.id) && !runningIds.has(line.id) && !pending.some((p) => p.lineId === line.id)) {
-          pending.push({ lineId: line.id, since: tick, hits: 1, kind: "level" });
+          pending.push({ lineId: line.id, since: tick, hits: 1, origin: "level" });
         }
         break;
       }
@@ -199,14 +210,13 @@ var ReplayController = class {
         type: "event",
         lineId: ev.lineId,
         eventKind: ev.kind,
-        detail: `tick ${tick} \u4E8B\u4EF6\uFF1A${ev.lineId} ${eventLabel(ev.kind)}${ev.kind === "setPriority" ? ` ${ev.priority}` : ""}`
+        detail: `tick ${tick} \u4E8B\u4EF6\uFF1A${ev.lineId} ${eventLabel(ev.kind)}` + (ev.kind === "setPriority" ? ` ${ev.priority}` : "") + (ev.kind === "setMode" ? ` ${ev.mode}` : "")
       });
     }
     const top = this.state.stack[this.state.stack.length - 1];
     if (top && top.elapsed >= top.total) {
       this.state.stack.pop();
       this.state.runningIds.delete(top.lineId);
-      this.entryPriority.delete(top.lineId);
       completed = { lineId: top.lineId };
       this.logs.push({
         tick,
@@ -216,7 +226,7 @@ var ReplayController = class {
       });
       const cfg = this.state.cfg.get(top.lineId);
       if (cfg.mode === "level" && this.state.levelAsserted.has(top.lineId) && !this.state.masked.has(top.lineId) && !this.state.pending.some((p) => p.lineId === top.lineId)) {
-        this.state.pending.push({ lineId: top.lineId, since: tick, hits: 1, kind: "level" });
+        this.state.pending.push({ lineId: top.lineId, since: tick, hits: 1, origin: "level" });
       }
       const parent = this.state.stack[this.state.stack.length - 1];
       if (parent) parent.preempted = true;
@@ -232,7 +242,7 @@ var ReplayController = class {
       } else {
         action = { type: "idle" };
       }
-    } else if (winner && this.state.cfg.get(winner.lineId).priority > this.entryPriority.get(currentTop.lineId)) {
+    } else if (winner && this.state.cfg.get(winner.lineId).priority > currentTop.entryPriority) {
       currentTop.preempted = true;
       this.enterFrame(winner, tick);
       action = { type: "preempt", by: winner.lineId, resumed: currentTop.lineId };
@@ -240,7 +250,7 @@ var ReplayController = class {
         tick,
         type: "preempt",
         lineId: winner.lineId,
-        detail: `tick ${tick} \u62A2\u5360\uFF1A${winner.lineId}\uFF08\u4F18\u5148\u7EA7 ${this.state.cfg.get(winner.lineId).priority}\uFF09\u62A2\u5360 ${currentTop.lineId}\uFF08\u4F18\u5148\u7EA7 ${this.state.cfg.get(currentTop.lineId).priority}\uFF09\uFF0C\u540C\u4F18\u5148\u7EA7\u5019\u9009\u7EE7\u7EED\u7B49\u5F85`
+        detail: `tick ${tick} \u62A2\u5360\uFF1A${winner.lineId}\uFF08\u5F53\u524D\u4F18\u5148\u7EA7 ${this.state.cfg.get(winner.lineId).priority}\uFF09\u62A2\u5360 ${currentTop.lineId}\uFF08\u8FDB\u5165\u95E8\u69DB p${currentTop.entryPriority}\uFF1B\u5F53\u524D p${this.state.cfg.get(currentTop.lineId).priority} \u4E0D\u6539\u53D8\u95E8\u69DB\uFF09\uFF0C\u540C\u4F18\u5148\u7EA7\u5019\u9009\u7EE7\u7EED\u7B49\u5F85`
       });
     } else if (currentTop.preempted) {
       action = { type: "resume", lineId: currentTop.lineId };
@@ -290,6 +300,7 @@ var ReplayController = class {
       pending: this.state.pending.slice().sort(comparePending).map((p) => ({ ...p })),
       levelAsserted: [...this.state.levelAsserted].sort(),
       masked: [...this.state.masked].sort(),
+      lineStates: [...this.state.cfg.values()].map((l) => ({ lineId: l.id, priority: l.priority, mode: l.mode })).sort((a, b) => a.lineId < b.lineId ? -1 : a.lineId > b.lineId ? 1 : 0),
       topRemaining: execTop ? execTop.total - execTop.elapsed : null
     };
   }
@@ -301,10 +312,12 @@ var ReplayController = class {
       total: cfg.handlerTicks,
       elapsed: 0,
       enteredAt: tick,
+      // 抢占门槛与模式在进入时冻结，运行中 setPriority/setMode 不影响本帧。
+      entryPriority: cfg.priority,
+      entryMode: cfg.mode,
       preempted: false
     });
     this.state.runningIds.add(p.lineId);
-    this.entryPriority.set(p.lineId, cfg.priority);
   }
 };
 function eventLabel(kind) {
@@ -389,6 +402,24 @@ var DEMOS = [
       { at: 7, lineId: "L", kind: "mask" },
       { at: 9, lineId: "L", kind: "unmask" },
       { at: 10, lineId: "L", kind: "lower" }
+    ]
+  },
+  {
+    name: "\u5207\u6A21\u5F0F + \u540C tick \u8C03\u7EA7",
+    description: "A \u5148\u5C4F\u853D\u5E76\u8FB9\u6CBF\u89E6\u53D1\uFF0Ct3 \u6539\u4E3A\u7535\u5E73\u5E76\u89E3\u9664\u5C4F\u853D\uFF1A\u65E7\u8FB9\u6CBF\u5F85\u5904\u7406\u4F4D\u4ECD\u6267\u884C\u4E00\u6B21\uFF1B\u540C tick \u628A\u8FD0\u884C\u4E2D\u7684 B \u4ECE p3 \u964D\u5230 p1\uFF0C\u7B49\u5F85\u7684 C(p2) \u5728\u8C03\u7EA7\u5F53 tick \u4E0D\u62A2\u5360\uFF08\u95E8\u69DB\u51BB\u7ED3\uFF09\uFF0CB \u8DD1\u5B8C\u540E\u4F9D\u6B21\u6267\u884C A\u3001C\u3002",
+    lines: [
+      { id: "A", priority: 2, mode: "edge", handlerTicks: 2 },
+      { id: "B", priority: 3, mode: "edge", handlerTicks: 4 },
+      { id: "C", priority: 2, mode: "edge", handlerTicks: 1 }
+    ],
+    events: [
+      { at: 1, lineId: "A", kind: "mask" },
+      { at: 1, lineId: "A", kind: "raise" },
+      { at: 2, lineId: "B", kind: "raise" },
+      { at: 2, lineId: "C", kind: "raise" },
+      { at: 3, lineId: "A", kind: "setMode", mode: "level" },
+      { at: 3, lineId: "A", kind: "unmask" },
+      { at: 3, lineId: "B", kind: "setPriority", priority: 1 }
     ]
   }
 ];
@@ -522,6 +553,11 @@ function renderChips() {
     els.chips.appendChild(c);
   }
 }
+function lineStateAt(rec, id) {
+  const s = rec.lineStates.find((x) => x.lineId === id);
+  const init = config.lines.find((l) => l.id === id);
+  return s ? { priority: s.priority, mode: s.mode } : { priority: init.priority, mode: init.mode };
+}
 function currentRecord() {
   if (!controller || controller.ticks.length === 0) return null;
   const idx = selectedTick > 0 ? selectedTick - 1 : controller.ticks.length - 1;
@@ -543,24 +579,29 @@ function renderState(rec) {
     els.stackView.innerHTML = '<span class="hint">CPU \u7A7A\u95F2</span>';
   }
   rec.stack.forEach((f, i) => {
-    const cfg = config.lines.find((l) => l.id === f.lineId);
+    const cur = lineStateAt(rec, f.lineId);
     const top = i === rec.stack.length - 1;
     const pct = Math.round(f.elapsed / f.total * 100);
+    const changed = cur.priority !== f.entryPriority;
+    const priNote = changed ? ` <span class="mono2" style="opacity:.7;text-decoration:line-through">p${f.entryPriority}</span> <span class="mono2">\u2192p${cur.priority}</span>` : ` <span class="mono2">p${f.entryPriority}</span>`;
     const div = document.createElement("div");
     div.className = "frame" + (top ? " top" : "");
     div.style.borderLeftColor = lineColor(f.lineId);
     div.innerHTML = `
       <div style="flex:1">
-        <b style="color:${lineColor(f.lineId)}">${f.lineId}</b>
-        <span class="mono2"> p${cfg.priority} \xB7 ${cfg.mode === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"}</span>
+        <b style="color:${lineColor(f.lineId)}">${f.lineId}</b>${priNote}
+        <span class="mono2"> \xB7 ${f.entryMode === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"}\uFF08\u8FDB\u5165\u65F6\uFF09</span>
         <div class="bar"><i style="width:${pct}%;background:${lineColor(f.lineId)}"></i></div>
       </div>
       <div class="mono2" style="white-space:nowrap">${f.elapsed}/${f.total} tick</div>`;
     els.stackView.appendChild(div);
   });
-  els.pendingBox.innerHTML = rec.pending.length ? rec.pending.map(
-    (p) => `<span class="pill ${p.kind}" style="border-color:${lineColor(p.lineId)}">${p.lineId} \xB7 since t${p.since} \xB7 \xD7${p.hits}</span>`
-  ).join("") : '<span class="hint">\u65E0\u5F85\u5904\u7406\u4F4D</span>';
+  els.pendingBox.innerHTML = rec.pending.length ? rec.pending.map((p) => {
+    const cur = lineStateAt(rec, p.lineId);
+    const stale = cur.mode !== p.origin;
+    const staleTag = stale ? ` <span class="mono2" style="opacity:.75">[\u65E7${p.origin === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"}\u4F4D\xB7\u5F53\u524D${cur.mode === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"}]</span>` : "";
+    return `<span class="pill ${p.origin}${stale ? " stale" : ""}" style="border-color:${lineColor(p.lineId)}">${p.lineId} \xB7 since t${p.since} \xB7 \xD7${p.hits}${staleTag}</span>`;
+  }).join("") : '<span class="hint">\u65E0\u5F85\u5904\u7406\u4F4D</span>';
   els.levelBox.innerHTML = rec.levelAsserted.length ? rec.levelAsserted.map((id) => `<span class="pill level" style="border-color:${lineColor(id)}">${id} \u7535\u5E73\u6709\u6548</span>`).join("") : '<span class="hint">\u65E0\u6709\u6548\u7535\u5E73</span>';
   els.maskBox.innerHTML = rec.masked.length ? rec.masked.map((id) => `<span class="pill mask" style="border-color:${lineColor(id)}">${id} \u5C4F\u853D\u4E2D</span>`).join("") : '<span class="hint">\u65E0\u5C4F\u853D</span>';
 }
@@ -579,10 +620,8 @@ function actionTag(r) {
   }
 }
 function eventsAt(t) {
-  const m = /* @__PURE__ */ new Map();
   const rec = controller?.ticks[t - 1];
-  if (rec) for (const e of rec.eventsApplied) m.set(e.lineId, e.kind);
-  return m;
+  return rec ? rec.eventsApplied : [];
 }
 function renderTimeline() {
   if (!controller || !config) {
@@ -608,11 +647,13 @@ function renderTimeline() {
     html += `<tr><td style="position:sticky;left:0;background:var(--panel);font-size:10px"><b style="color:${color}">${line.id}</b> <span class="mono2">p${line.priority}</span></td>`;
     for (let t = 1; t <= last; t++) {
       const r = ticks[t - 1];
-      const ev = r ? eventsAt(t).get(line.id) : void 0;
+      const evs = r ? eventsAt(t).filter((e) => e.lineId === line.id) : [];
+      const ev = evs.length ? evs[evs.length - 1].kind : void 0;
       let bg = "";
       let content = "";
       let title = "";
       if (r) {
+        const st = lineStateAt(r, line.id);
         const onStack = r.stack.some((f) => f.lineId === line.id);
         const top = r.stack[r.stack.length - 1];
         const isTop = top && top.lineId === line.id;
@@ -623,8 +664,8 @@ function renderTimeline() {
           title = isTop ? "\u6B63\u5728\u6267\u884C" : "\u88AB\u62A2\u5360\u6302\u8D77";
         } else if (pend) {
           content = `P${pend.hits > 1 ? pend.hits : ""}`;
-          title = `\u5F85\u5904\u7406 since t${pend.since}\uFF0C\u5408\u5E76 ${pend.hits} \u6B21`;
-        } else if (line.mode === "level" && r.levelAsserted.includes(line.id)) {
+          title = `\u5F85\u5904\u7406\uFF08\u6765\u6E90${pend.origin === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"}\uFF09since t${pend.since}\uFF0C\u5408\u5E76 ${pend.hits} \u6B21`;
+        } else if (st.mode === "level" && r.levelAsserted.includes(line.id)) {
           content = "~";
           title = "\u8F93\u5165\u7535\u5E73\u6709\u6548";
         }
@@ -635,7 +676,8 @@ function renderTimeline() {
       }
       const evCls = ev ? ` ev-${ev}` : "";
       const sel = selectedTick === t ? " selected" : "";
-      html += `<td class="cell${evCls}${sel}" data-tick="${t}" style="${bg}" title="t${t} ${line.id}\uFF1A${title}${ev ? "\uFF1B\u4E8B\u4EF6 " + ev : ""}">${content}</td>`;
+      const evText = evs.map((e) => eventZh(e.kind) + ("priority" in e && e.priority !== void 0 ? ` p${e.priority}` : "") + (e.mode ? `\u2192${e.mode === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"}` : "")).join("\uFF1B");
+      html += `<td class="cell${evCls}${sel}" data-tick="${t}" style="${bg}" title="t${t} ${line.id}\uFF1A${title}${evText ? "\uFF1B\u4E8B\u4EF6 " + evText : ""}">${content}</td>`;
     }
     html += "</tr>";
   }
@@ -652,7 +694,12 @@ function renderTable() {
   }
   let html = '<table class="records"><tr><th>tick</th><th>\u4E8B\u4EF6(\u9636\u6BB5A)</th><th>\u5B8C\u6210(\u9636\u6BB5B)</th><th>\u52A8\u4F5C(\u9636\u6BB5C/D)</th><th>\u6267\u884C\u6808\uFF08\u5E95\u2192\u9876\uFF09</th><th>\u5F85\u5904\u7406\u8BC1\u636E</th></tr>';
   for (const r of controller.ticks) {
-    const evs = r.eventsApplied.length ? r.eventsApplied.map((e) => `<span class="tag event">${e.lineId}\xB7${eventZh(e.kind)}</span>`).join(" ") : '<span class="mono2">\u2014</span>';
+    const evs = r.eventsApplied.length ? r.eventsApplied.map((e) => {
+      let suffix = "";
+      if (e.kind === "setPriority") suffix = ` p${e.priority}`;
+      if (e.kind === "setMode") suffix = `\u2192${e.mode === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"}`;
+      return `<span class="tag event">${e.lineId}\xB7${eventZh(e.kind)}${suffix}</span>`;
+    }).join(" ") : '<span class="mono2">\u2014</span>';
     const comp = r.completed ? `<span class="tag complete">${r.completed.lineId} \u5B8C\u6210</span>` : '<span class="mono2">\u2014</span>';
     let actionDesc;
     if (r.action.type === "preempt")
@@ -666,9 +713,16 @@ function renderTable() {
     else actionDesc = '<span class="tag idle">\u7A7A\u95F2</span>';
     const stack = r.stack.length ? r.stack.map((f) => {
       const top = f === r.stack[r.stack.length - 1];
-      return `<span style="color:${lineColor(f.lineId)}">${top ? "\u25B6" : "\u2225"}${f.lineId}(${f.elapsed}/${f.total})</span>`;
+      const cur = lineStateAt(r, f.lineId);
+      const dem = cur.priority !== f.entryPriority ? `(p${f.entryPriority}\u2192p${cur.priority})` : `(p${f.entryPriority})`;
+      return `<span style="color:${lineColor(f.lineId)}">${top ? "\u25B6" : "\u2225"}${f.lineId}${dem} ${f.elapsed}/${f.total}</span>`;
     }).join(" \u2190 ") : '<span class="mono2">\u2205</span>';
-    const pend = r.pending.length ? r.pending.map((p) => `<span class="pill ${p.kind}" style="border-color:${lineColor(p.lineId)}">${p.lineId} since t${p.since} \xD7${p.hits}</span>`).join(" ") : '<span class="mono2">\u2205</span>';
+    const pend = r.pending.length ? r.pending.map((p) => {
+      const cur = lineStateAt(r, p.lineId);
+      const stale = cur.mode !== p.origin ? " stale" : "";
+      const tag = cur.mode !== p.origin ? ` [\u65E7${p.origin === "edge" ? "\u8FB9" : "\u5E73"}\u2192\u4ECA${cur.mode === "edge" ? "\u8FB9" : "\u5E73"}]` : "";
+      return `<span class="pill ${p.origin}${stale}" style="border-color:${lineColor(p.lineId)}">${p.lineId} since t${p.since} \xD7${p.hits}${tag}</span>`;
+    }).join(" ") : '<span class="mono2">\u2205</span>';
     html += `<tr class="${selectedTick === r.tick ? "hl" : ""}" data-tick="${r.tick}">
       <td>${r.tick}</td><td>${evs}</td><td>${comp}</td><td>${actionDesc}</td><td>${stack}</td><td>${pend}</td></tr>`;
   }
@@ -697,7 +751,22 @@ function renderLogs() {
   });
 }
 function eventZh(k) {
-  return k === "raise" ? "\u89E6\u53D1/\u62C9\u9AD8" : k === "lower" ? "\u64A4\u9500\u7535\u5E73" : k === "mask" ? "\u5C4F\u853D" : "\u89E3\u9664\u5C4F\u853D";
+  switch (k) {
+    case "raise":
+      return "\u89E6\u53D1/\u62C9\u9AD8";
+    case "lower":
+      return "\u64A4\u9500\u7535\u5E73";
+    case "mask":
+      return "\u5C4F\u853D";
+    case "unmask":
+      return "\u89E3\u9664\u5C4F\u853D";
+    case "setPriority":
+      return "\u8C03\u4F18\u5148\u7EA7";
+    case "setMode":
+      return "\u5207\u6A21\u5F0F";
+    default:
+      return k;
+  }
 }
 function logZh(t) {
   return { enter: "\u8FDB\u5165", preempt: "\u62A2\u5360", resume: "\u6062\u590D", continue: "\u6267\u884C", complete: "\u5B8C\u6210", event: "\u4E8B\u4EF6", idle: "\u7A7A\u95F2" }[t] ?? t;

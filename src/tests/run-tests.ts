@@ -139,7 +139,7 @@ describe('边沿：屏蔽期保留 1 个待处理位，重复触发合并', () =
   ];
   const trace = runReplay(lines, events);
   const pendAt3 = trace.ticks[2].pending.find((p) => p.lineId === 'E')!;
-  eq(pendAt3, { lineId: 'E', since: 2, hits: 3, kind: 'edge' }, 'tick3 末：3 次触发合并为 1 位');
+  eq(pendAt3, { lineId: 'E', since: 2, hits: 3, origin: 'edge' }, 'tick3 末：3 次触发合并为 1 位');
   eq(actions(trace), ['idle', 'idle', 'idle', 'enter:E', 'idle'], '解除屏蔽后下一次调度才进入');
   eq(trace.ticks[3].pending.length, 0, 'tick4 进入后待处理位被消费');
 });
@@ -239,6 +239,103 @@ describe('屏蔽正在运行的线：当前处理程序跑完；屏蔽期边沿�
 });
 
 // ---------------------------------------------------------------------------
+// 场景 8：模式切换 + 同 tick 调级（控制器工程师的中断回放情形）
+//  - A 先屏蔽并以边沿触发（旧待处理位），t3 改电平并解除屏蔽：旧边沿位仍执行一次；
+//  - B 正在运行，t3 同 tick 被调低优先级（p3→p1），C(p2) 等待：
+//    调级当 tick C 不能抢占，且之后也不能借调级抢占（门槛冻结在进入时 p3）；
+//  - 运行中的 B 一直跑完；不同批次推进轨迹一致由后续 crossCheck 保证。
+// ---------------------------------------------------------------------------
+describe('模式切换 + 同 tick 调级：旧边沿位仍执行；调级当 tick 不抢占；运行者跑完', () => {
+  const lines: LineConfig[] = [
+    { id: 'A', priority: 2, mode: 'edge', handlerTicks: 2 },
+    { id: 'B', priority: 3, mode: 'edge', handlerTicks: 4 },
+    { id: 'C', priority: 2, mode: 'edge', handlerTicks: 1 },
+  ];
+  const events: ScheduledEvent[] = [
+    { at: 1, lineId: 'A', kind: 'mask' },
+    { at: 1, lineId: 'A', kind: 'raise' },
+    { at: 2, lineId: 'B', kind: 'raise' },
+    { at: 2, lineId: 'C', kind: 'raise' },
+    { at: 3, lineId: 'A', kind: 'setMode', mode: 'level' },
+    { at: 3, lineId: 'A', kind: 'unmask' },
+    { at: 3, lineId: 'B', kind: 'setPriority', priority: 1 },
+  ];
+  const trace = runReplay(lines, events);
+  eq(
+    actions(trace),
+    ['idle', 'enter:B', 'cont:B', 'cont:B', 'cont:B', 'enter:A', 'cont:A', 'enter:C', 'idle'],
+    'C 在 t3 调级当 tick 不抢占 B；B 跑完（t5 收尾，t6 出栈）'
+  );
+  eq(completes(trace), [[6, 'B'], [8, 'A'], [9, 'C']], 'B 跑完后 A（旧边沿位）再到 C');
+
+  // t3 末：A 已切成电平并解除屏蔽，但待处理位仍是切模式前的旧 edge 位。
+  const pendA3 = trace.ticks[2].pending.find((p) => p.lineId === 'A')!;
+  eq(pendA3.origin, 'edge', '旧边沿位切到电平后来源仍为 edge（三视图一致：仍执行一次）');
+  const modeA3 = trace.ticks[2].lineStates.find((l) => l.lineId === 'A')!;
+  eq(modeA3, { lineId: 'A', priority: 2, mode: 'level' }, 't3 末 A 当前模式确为 level');
+  const priB3 = trace.ticks[2].lineStates.find((l) => l.lineId === 'B')!;
+  eq(priB3.priority, 1, 't3 末 B 当前优先级已降为 1');
+  eq(trace.ticks[2].stack[0].entryPriority, 3, '栈中 B 帧的抢占门槛仍冻结在进入时 p3');
+
+  // 旧 edge 位只执行一次：A 在电平模式下没有物理电平，t6 进入后不会重入。
+  eq(trace.ticks[5].levelAsserted.includes('A'), false, '切模式本身不合成物理电平');
+  const aRuns = trace.ticks.filter((r) => r.stack.some((f) => f.lineId === 'A')).length;
+  eq(aRuns, 2, 'A 的旧待处理位仅执行一次（2 个执行 tick），不重入');
+});
+
+// ---------------------------------------------------------------------------
+// 场景 9：edge→level 后旧边沿位对 lower 免疫，且只执行一次
+// ---------------------------------------------------------------------------
+describe('edge→level：遗留 edge 位不受 lower 影响，执行一次即消费', () => {
+  const lines: LineConfig[] = [{ id: 'A', priority: 1, mode: 'edge', handlerTicks: 1 }];
+  const events: ScheduledEvent[] = [
+    { at: 1, lineId: 'A', kind: 'mask' },
+    { at: 2, lineId: 'A', kind: 'raise' },
+    { at: 3, lineId: 'A', kind: 'setMode', mode: 'level' },
+    { at: 3, lineId: 'A', kind: 'lower' }, // 当前电平模式，但无物理电平且位是 edge 来源
+    { at: 4, lineId: 'A', kind: 'unmask' },
+  ];
+  const trace = runReplay(lines, events);
+  eq(actions(trace), ['idle', 'idle', 'idle', 'enter:A', 'idle'], 'lower 清不掉旧 edge 位，解除屏蔽后仍执行');
+  const p3 = trace.ticks[2].pending.find((x) => x.lineId === 'A')!;
+  eq(p3.origin, 'edge', 't3 末来源仍标记为 edge（与逐 tick 表/时间轴同源）');
+});
+
+// ---------------------------------------------------------------------------
+// 场景 10：level→edge 后不重放残留物理电平（不无限重入）
+// ---------------------------------------------------------------------------
+describe('level→edge：处理完成不重入；残留物理电平不合成边沿', () => {
+  const lines: LineConfig[] = [{ id: 'L', priority: 1, mode: 'level', handlerTicks: 2 }];
+  const events: ScheduledEvent[] = [
+    { at: 1, lineId: 'L', kind: 'raise' },
+    { at: 2, lineId: 'L', kind: 'setMode', mode: 'edge' },
+  ];
+  const trace = runReplay(lines, events);
+  eq(actions(trace), ['enter:L', 'cont:L', 'idle'], 't2 切成边沿后，t3 完成不再电平重入');
+  eq(trace.ticks[2].levelAsserted, ['L'], '物理电平证据仍保留（仅不再驱动调度）');
+});
+
+// ---------------------------------------------------------------------------
+// 场景 11：同一 tick 多个事件按输入顺序生效（含调级/切模式穿插）
+// ---------------------------------------------------------------------------
+describe('同 tick 多事件按输入顺序：先调级后触发，当 tick 即按新优先级调度', () => {
+  const lines: LineConfig[] = [
+    { id: 'P', priority: 3, mode: 'edge', handlerTicks: 3 },
+    { id: 'Q', priority: 1, mode: 'edge', handlerTicks: 1 },
+  ];
+  const events: ScheduledEvent[] = [
+    { at: 1, lineId: 'P', kind: 'raise' },
+    // t2：先把 Q 调到比 P 进入门槛(p3)更高，再触发 Q —— 当 tick 即可抢占。
+    { at: 2, lineId: 'Q', kind: 'setPriority', priority: 5 },
+    { at: 2, lineId: 'Q', kind: 'raise' },
+  ];
+  const trace = runReplay(lines, events);
+  eq(actions(trace), ['enter:P', 'preempt:Q>P', 'resume:P', 'cont:P', 'idle'],
+    '同 tick 内 setPriority 先于 raise 生效，Q 以 p5 在当 tick 抢占；Q 完成后 P 跑完');
+  eq(completes(trace), [[3, 'Q'], [5, 'P']], 'Q 先完成，P 恢复后跑完');
+});
+
+// ---------------------------------------------------------------------------
 // 交叉核对：不同批次推进 vs 参考状态机（逐 tick）
 // ---------------------------------------------------------------------------
 function normalize(rec: TickRecord): string {
@@ -253,10 +350,13 @@ function normalize(rec: TickRecord): string {
       elapsed: f.elapsed,
       preempted: f.preempted,
       enteredAt: f.enteredAt,
+      entryPriority: f.entryPriority,
+      entryMode: f.entryMode,
     })),
     pending: rec.pending,
     levelAsserted: rec.levelAsserted,
     masked: rec.masked,
+    lineStates: rec.lineStates,
     topRemaining: rec.topRemaining,
   });
 }
@@ -322,6 +422,38 @@ describe('不同批次推进 ↔ 逐 tick 参考状态机（固定场景）', ()
     { at: 4, lineId: 'Y', kind: 'lower' },
     { at: 5, lineId: 'Y', kind: 'raise' },
   ]);
+
+  // 场景 8 的输入也必须在各批次与逐 tick 参考机完全一致。
+  crossCheck('模式切换+同tick调级', [
+    { id: 'A', priority: 2, mode: 'edge', handlerTicks: 2 },
+    { id: 'B', priority: 3, mode: 'edge', handlerTicks: 4 },
+    { id: 'C', priority: 2, mode: 'edge', handlerTicks: 1 },
+  ], [
+    { at: 1, lineId: 'A', kind: 'mask' },
+    { at: 1, lineId: 'A', kind: 'raise' },
+    { at: 2, lineId: 'B', kind: 'raise' },
+    { at: 2, lineId: 'C', kind: 'raise' },
+    { at: 3, lineId: 'A', kind: 'setMode', mode: 'level' },
+    { at: 3, lineId: 'A', kind: 'unmask' },
+    { at: 3, lineId: 'B', kind: 'setPriority', priority: 1 },
+  ]);
+
+  // 两个方向的模式切换 + 电平撤销穿插。
+  crossCheck('双向切模式+电平撤销', [
+    { id: 'X', priority: 2, mode: 'edge', handlerTicks: 2 },
+    { id: 'Y', priority: 1, mode: 'level', handlerTicks: 1 },
+  ], [
+    { at: 1, lineId: 'X', kind: 'mask' },
+    { at: 1, lineId: 'X', kind: 'raise' },
+    { at: 2, lineId: 'X', kind: 'setMode', mode: 'level' },
+    { at: 2, lineId: 'X', kind: 'lower' },
+    { at: 3, lineId: 'X', kind: 'unmask' },
+    { at: 1, lineId: 'Y', kind: 'raise' },
+    { at: 2, lineId: 'Y', kind: 'setMode', mode: 'edge' },
+    { at: 4, lineId: 'Y', kind: 'raise' },
+    { at: 5, lineId: 'Y', kind: 'setMode', mode: 'level' },
+    { at: 5, lineId: 'Y', kind: 'raise' },
+  ]);
 });
 
 // ---------------------------------------------------------------------------
@@ -340,7 +472,7 @@ function mulberry32(seed: number): () => number {
 
 describe('模糊测试：200 个随机场景，逐状态对齐参考机', () => {
   const rand = mulberry32(20261001);
-  const kinds: ScheduledEvent['kind'][] = ['raise', 'lower', 'mask', 'unmask'];
+  const kinds: ScheduledEvent['kind'][] = ['raise', 'lower', 'mask', 'unmask', 'setPriority', 'setMode'];
   let mismatch = 0;
   for (let it = 0; it < 200; it++) {
     const n = 1 + Math.floor(rand() * 8);
@@ -353,11 +485,14 @@ describe('模糊测试：200 个随机场景，逐状态对齐参考机', () => 
       initiallyMasked: rand() < 0.15,
     }));
     const evCount = Math.floor(rand() * 24);
-    const events: ScheduledEvent[] = Array.from({ length: evCount }, () => ({
-      at: 1 + Math.floor(rand() * 30),
-      lineId: ids[Math.floor(rand() * n)],
-      kind: kinds[Math.floor(rand() * kinds.length)],
-    }));
+    const events: ScheduledEvent[] = Array.from({ length: evCount }, () => {
+      const kind = kinds[Math.floor(rand() * kinds.length)];
+      const lineId = ids[Math.floor(rand() * n)];
+      const at = 1 + Math.floor(rand() * 30);
+      if (kind === 'setPriority') return { at, lineId, kind, priority: 1 + Math.floor(rand() * 6) };
+      if (kind === 'setMode') return { at, lineId, kind, mode: rand() < 0.5 ? ('edge' as const) : ('level' as const) };
+      return { at, lineId, kind };
+    });
 
     const ref = new ReferenceMachine(lines, events);
     const refRecs: string[] = [];

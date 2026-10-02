@@ -24,7 +24,7 @@
           <label>中断线（JSON 数组：id / priority / mode=edge|level / handlerTicks / initiallyMasked?）</label>
           <textarea id="linesJson" rows="9" spellcheck="false"></textarea>
 
-          <label>事件（JSON 数组：at / lineId / kind=raise|lower|mask|unmask）</label>
+          <label>事件（JSON 数组：at / lineId / kind=raise|lower|mask|unmask|setPriority|setMode；后两者分别附 priority / mode）</label>
           <textarea id="eventsJson" rows="8" spellcheck="false"></textarea>
 
           <div class="btnrow">
@@ -82,7 +82,8 @@
             <span><i style="background:var(--continue)"></i>执行中</span>
             <span><i style="background:var(--idle)"></i>空闲</span>
             <span>▶ 栈顶执行 ｜ ∥ 被抢占挂起 ｜ ■ 完成 ｜ P 待处理（数字为合并次数）｜ ~ 电平有效</span>
-            <span>▲ raise ｜ ▼ lower ｜ ⛔ mask ｜ ✓ unmask</span>
+            <span>▲ raise ｜ ▼ lower ｜ ⛔ mask ｜ ✓ unmask ｜ ⇄ setMode ｜ p setPriority</span>
+            <span>虚线「旧位」：模式切换前挂起的待处理位，按其来源仍会执行一次，切模式不重放历史、不合成边沿。</span>
           </div>
           <div class="warn" id="trunc" style="display:none"></div>
           <div class="tabs">

@@ -161,6 +161,14 @@ function renderChips(): void {
   }
 }
 
+/** 取某条线在指定 tick 结束后的动态配置（优先级/模式可能已被事件改变）。 */
+function lineStateAt(rec: TickRecord, id: string): { priority: number; mode: string } {
+  const s = rec.lineStates.find((x) => x.lineId === id);
+  // 回退到初始配置（理论上 lineStates 总有该线）。
+  const init = config!.lines.find((l) => l.id === id)!;
+  return s ? { priority: s.priority, mode: s.mode } : { priority: init.priority, mode: init.mode };
+}
+
 // ---------- 当前 tick 状态卡 ----------
 function currentRecord(): TickRecord | null {
   if (!controller || controller.ticks.length === 0) return null;
@@ -180,22 +188,26 @@ function renderState(rec: TickRecord | null): void {
   }
   els.remaining.textContent = rec.topRemaining === null ? '空闲' : `${rec.topRemaining} tick`;
 
-  // 执行栈（自底向上）
+  // 执行栈（自底向上）：帧的模式/门槛显示进入时冻结值，并在被调级时提示当前值。
   els.stackView.innerHTML = '';
   if (rec.stack.length === 0) {
     els.stackView.innerHTML = '<span class="hint">CPU 空闲</span>';
   }
   rec.stack.forEach((f, i) => {
-    const cfg = config!.lines.find((l) => l.id === f.lineId)!;
+    const cur = lineStateAt(rec, f.lineId);
     const top = i === rec.stack.length - 1;
     const pct = Math.round((f.elapsed / f.total) * 100);
+    const changed = cur.priority !== f.entryPriority;
+    const priNote = changed
+      ? ` <span class="mono2" style="opacity:.7;text-decoration:line-through">p${f.entryPriority}</span> <span class="mono2">→p${cur.priority}</span>`
+      : ` <span class="mono2">p${f.entryPriority}</span>`;
     const div = document.createElement('div');
     div.className = 'frame' + (top ? ' top' : '');
     div.style.borderLeftColor = lineColor(f.lineId);
     div.innerHTML = `
       <div style="flex:1">
-        <b style="color:${lineColor(f.lineId)}">${f.lineId}</b>
-        <span class="mono2"> p${cfg.priority} · ${cfg.mode === 'edge' ? '边沿' : '电平'}</span>
+        <b style="color:${lineColor(f.lineId)}">${f.lineId}</b>${priNote}
+        <span class="mono2"> · ${f.entryMode === 'edge' ? '边沿' : '电平'}（进入时）</span>
         <div class="bar"><i style="width:${pct}%;background:${lineColor(f.lineId)}"></i></div>
       </div>
       <div class="mono2" style="white-space:nowrap">${f.elapsed}/${f.total} tick</div>`;
@@ -204,10 +216,16 @@ function renderState(rec: TickRecord | null): void {
 
   els.pendingBox.innerHTML = rec.pending.length
     ? rec.pending
-        .map(
-          (p) =>
-            `<span class="pill ${p.kind}" style="border-color:${lineColor(p.lineId)}">${p.lineId} · since t${p.since} · ×${p.hits}</span>`
-        )
+        .map((p) => {
+          const cur = lineStateAt(rec, p.lineId);
+          // 当前模式与待处理位来源不一致，即「模式已切换但旧位仍在」——
+          // 明确标注，避免与逐 tick 表/日志产生互相矛盾的解读。
+          const stale = cur.mode !== p.origin;
+          const staleTag = stale
+            ? ` <span class="mono2" style="opacity:.75">[旧${p.origin === 'edge' ? '边沿' : '电平'}位·当前${cur.mode === 'edge' ? '边沿' : '电平'}]</span>`
+            : '';
+          return `<span class="pill ${p.origin}${stale ? ' stale' : ''}" style="border-color:${lineColor(p.lineId)}">${p.lineId} · since t${p.since} · ×${p.hits}${staleTag}</span>`;
+        })
         .join('')
     : '<span class="hint">无待处理位</span>';
   els.levelBox.innerHTML = rec.levelAsserted.length
@@ -234,11 +252,11 @@ function actionTag(r: TickRecord): { text: string; cls: string; color: string } 
   }
 }
 
-function eventsAt(t: number): Map<string, ScheduledEvent['kind']> {
-  const m = new Map<string, ScheduledEvent['kind']>();
+type AppliedEvent = TickRecord['eventsApplied'][number];
+function eventsAt(t: number): AppliedEvent[] {
   const rec = controller?.ticks[t - 1];
-  if (rec) for (const e of rec.eventsApplied) m.set(e.lineId, e.kind);
-  return m;
+  // 同一 tick 可能有多个事件（甚至同一线多个），必须全部保留、保持输入顺序。
+  return rec ? rec.eventsApplied : [];
 }
 
 function renderTimeline(): void {
@@ -272,11 +290,13 @@ function renderTimeline(): void {
     html += `<tr><td style="position:sticky;left:0;background:var(--panel);font-size:10px"><b style="color:${color}">${line.id}</b> <span class="mono2">p${line.priority}</span></td>`;
     for (let t = 1; t <= last; t++) {
       const r = ticks[t - 1];
-      const ev = r ? eventsAt(t).get(line.id) : undefined;
+      const evs = r ? eventsAt(t).filter((e) => e.lineId === line.id) : [];
+      const ev = evs.length ? evs[evs.length - 1].kind : undefined;
       let bg = '';
       let content = '';
       let title = '';
       if (r) {
+        const st = lineStateAt(r, line.id);
         const onStack = r.stack.some((f) => f.lineId === line.id);
         const top = r.stack[r.stack.length - 1];
         const isTop = top && top.lineId === line.id;
@@ -289,8 +309,8 @@ function renderTimeline(): void {
           title = isTop ? '正在执行' : '被抢占挂起';
         } else if (pend) {
           content = `P${pend.hits > 1 ? pend.hits : ''}`;
-          title = `待处理 since t${pend.since}，合并 ${pend.hits} 次`;
-        } else if (line.mode === 'level' && r.levelAsserted.includes(line.id)) {
+          title = `待处理（来源${pend.origin === 'edge' ? '边沿' : '电平'}）since t${pend.since}，合并 ${pend.hits} 次`;
+        } else if (st.mode === 'level' && r.levelAsserted.includes(line.id)) {
           content = '~';
           title = '输入电平有效';
         }
@@ -301,8 +321,11 @@ function renderTimeline(): void {
       }
       const evCls = ev ? ` ev-${ev}` : '';
       const sel = selectedTick === t ? ' selected' : '';
+      const evText = evs
+        .map((e) => eventZh(e.kind) + ('priority' in e && e.priority !== undefined ? ` p${e.priority}` : '') + (e.mode ? `→${e.mode === 'edge' ? '边沿' : '电平'}` : ''))
+        .join('；');
       html += `<td class="cell${evCls}${sel}" data-tick="${t}" style="${bg}" title="t${t} ${line.id}：${title}${
-        ev ? '；事件 ' + ev : ''
+        evText ? '；事件 ' + evText : ''
       }">${content}</td>`;
     }
     html += '</tr>';
@@ -324,7 +347,14 @@ function renderTable(): void {
   let html = '<table class="records"><tr><th>tick</th><th>事件(阶段A)</th><th>完成(阶段B)</th><th>动作(阶段C/D)</th><th>执行栈（底→顶）</th><th>待处理证据</th></tr>';
   for (const r of controller.ticks) {
     const evs = r.eventsApplied.length
-      ? r.eventsApplied.map((e) => `<span class="tag event">${e.lineId}·${eventZh(e.kind)}</span>`).join(' ')
+      ? r.eventsApplied
+          .map((e) => {
+            let suffix = '';
+            if (e.kind === 'setPriority') suffix = ` p${e.priority}`;
+            if (e.kind === 'setMode') suffix = `→${e.mode === 'edge' ? '边沿' : '电平'}`;
+            return `<span class="tag event">${e.lineId}·${eventZh(e.kind)}${suffix}</span>`;
+          })
+          .join(' ')
       : '<span class="mono2">—</span>';
     const comp = r.completed ? `<span class="tag complete">${r.completed.lineId} 完成</span>` : '<span class="mono2">—</span>';
     let actionDesc: string;
@@ -341,13 +371,20 @@ function renderTable(): void {
       ? r.stack
           .map((f) => {
             const top = f === r.stack[r.stack.length - 1];
-            return `<span style="color:${lineColor(f.lineId)}">${top ? '▶' : '∥'}${f.lineId}(${f.elapsed}/${f.total})</span>`;
+            const cur = lineStateAt(r, f.lineId);
+            const dem = cur.priority !== f.entryPriority ? `(p${f.entryPriority}→p${cur.priority})` : `(p${f.entryPriority})`;
+            return `<span style="color:${lineColor(f.lineId)}">${top ? '▶' : '∥'}${f.lineId}${dem} ${f.elapsed}/${f.total}</span>`;
           })
           .join(' ← ')
       : '<span class="mono2">∅</span>';
     const pend = r.pending.length
       ? r.pending
-          .map((p) => `<span class="pill ${p.kind}" style="border-color:${lineColor(p.lineId)}">${p.lineId} since t${p.since} ×${p.hits}</span>`)
+          .map((p) => {
+            const cur = lineStateAt(r, p.lineId);
+            const stale = cur.mode !== p.origin ? ' stale' : '';
+            const tag = cur.mode !== p.origin ? ` [旧${p.origin === 'edge' ? '边' : '平'}→今${cur.mode === 'edge' ? '边' : '平'}]` : '';
+            return `<span class="pill ${p.origin}${stale}" style="border-color:${lineColor(p.lineId)}">${p.lineId} since t${p.since} ×${p.hits}${tag}</span>`;
+          })
           .join(' ')
       : '<span class="mono2">∅</span>';
     html += `<tr class="${selectedTick === r.tick ? 'hl' : ''}" data-tick="${r.tick}">
@@ -381,7 +418,22 @@ function renderLogs(): void {
 }
 
 function eventZh(k: ScheduledEvent['kind']): string {
-  return k === 'raise' ? '触发/拉高' : k === 'lower' ? '撤销电平' : k === 'mask' ? '屏蔽' : '解除屏蔽';
+  switch (k) {
+    case 'raise':
+      return '触发/拉高';
+    case 'lower':
+      return '撤销电平';
+    case 'mask':
+      return '屏蔽';
+    case 'unmask':
+      return '解除屏蔽';
+    case 'setPriority':
+      return '调优先级';
+    case 'setMode':
+      return '切模式';
+    default:
+      return k;
+  }
 }
 function logZh(t: string): string {
   return (

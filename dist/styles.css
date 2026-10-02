@@ -317,6 +317,29 @@ td.ev-unmask::before {
   font-size: 9px;
   color: var(--enter);
 }
+td.ev-setMode::after {
+  content: '⇄';
+  position: absolute;
+  top: -2px;
+  right: 1px;
+  font-size: 8px;
+  color: #b07cf7;
+}
+td.ev-setPriority::after {
+  content: 'p';
+  position: absolute;
+  top: -2px;
+  right: 1px;
+  font-size: 7px;
+  font-weight: 700;
+  color: #e0a83d;
+}
+
+/* 模式已切换但仍是旧来源的待处理位：虚线 + 警示色，提示「旧位仍执行」 */
+.pill.stale {
+  border-style: dashed;
+  color: #e0a83d;
+}
 
 td.cell {
   cursor: pointer;

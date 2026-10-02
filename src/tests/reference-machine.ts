@@ -4,27 +4,25 @@
  * 交叉核对思路：对同一份配置与事件流，参考机每次只推进 1 个 tick（step1），
  * 被测机则用各种不同批次大小推进（advance(1)/advance(3)/一次性 runReplay），
  * 逐 tick 比较归一化后的完整状态快照；再加上手写期望序列核对具体场景。
+ *
+ * 参考机必须与被测机共享同一套语义定义，尤其是：
+ *  - setMode / setPriority 必须真正生效（不能忽略）；
+ *  - 待处理位按「来源 origin」解释，模式切换不清空位、不重放历史；
+ *  - 栈中帧的抢占门槛在进入时冻结（entryPriority），运行中调级不改变它。
  */
 
-import { LineConfig, PendingInfo, ScheduledEvent, TickRecord } from '../model.js';
-
-interface RefFrame {
-  lineId: string;
-  total: number;
-  elapsed: number;
-  enteredAt: number;
-  preempted: boolean;
-}
+import { FrameInfo, LineConfig, PendingInfo, ScheduledEvent, TickRecord } from '../model.js';
 
 interface RefSnapshot {
   tick: number;
-  eventsApplied: Array<{ lineId: string; kind: ScheduledEvent['kind'] }>;
+  eventsApplied: Array<{ lineId: string; kind: ScheduledEvent['kind']; priority?: number; mode?: LineConfig['mode'] }>;
   completed?: { lineId: string };
   action: TickRecord['action'];
-  stack: RefFrame[];
+  stack: FrameInfo[];
   pending: PendingInfo[];
   levelAsserted: string[];
   masked: string[];
+  lineStates: TickRecord['lineStates'];
   topRemaining: number | null;
 }
 
@@ -32,7 +30,7 @@ export class ReferenceMachine {
   private cfg: Map<string, LineConfig>;
   private evs: ScheduledEvent[][];
   private t = 0;
-  private stack: RefFrame[] = [];
+  private stack: FrameInfo[] = [];
   private pending: PendingInfo[] = [];
   private level = new Set<string>();
   private masked = new Set<string>();
@@ -76,6 +74,82 @@ export class ReferenceMachine {
       );
   }
 
+  /** 阶段 A：应用单个事件（与 simulator.ts 的 applyEvent 语义一致）。 */
+  private apply(e: ScheduledEvent, tick: number): void {
+    const cfg = this.cfg.get(e.lineId)!;
+    const p = this.pending.find((x) => x.lineId === e.lineId);
+    switch (e.kind) {
+      case 'raise': {
+        if (cfg.mode === 'edge') {
+          if (p) p.hits += 1;
+          else this.pending.push({ lineId: cfg.id, since: tick, hits: 1, origin: 'edge' });
+        } else {
+          this.level.add(cfg.id);
+          if (!this.masked.has(cfg.id) && !this.running.has(cfg.id) && !p) {
+            this.pending.push({ lineId: cfg.id, since: tick, hits: 1, origin: 'level' });
+          }
+        }
+        break;
+      }
+      case 'lower': {
+        if (cfg.mode === 'level') {
+          this.level.delete(cfg.id);
+          if (!this.running.has(cfg.id)) {
+            const i = this.pending.findIndex((x) => x.lineId === cfg.id && x.origin === 'level');
+            if (i >= 0) this.pending.splice(i, 1);
+          }
+        }
+        break;
+      }
+      case 'mask': {
+        this.masked.add(cfg.id);
+        if (cfg.mode === 'level' && !this.running.has(cfg.id)) {
+          const i = this.pending.findIndex((x) => x.lineId === cfg.id && x.origin === 'level');
+          if (i >= 0) this.pending.splice(i, 1);
+        }
+        break;
+      }
+      case 'unmask': {
+        this.masked.delete(cfg.id);
+        if (
+          cfg.mode === 'level' &&
+          this.level.has(cfg.id) &&
+          !this.running.has(cfg.id) &&
+          !this.pending.some((x) => x.lineId === cfg.id)
+        ) {
+          this.pending.push({ lineId: cfg.id, since: tick, hits: 1, origin: 'level' });
+        }
+        break;
+      }
+      case 'setPriority': {
+        // 只影响后续调度；栈中帧门槛已冻结，不在这里改动。
+        this.cfg.set(cfg.id, { ...cfg, priority: e.priority! });
+        break;
+      }
+      case 'setMode': {
+        // 不清空位、不重放历史；origin 保留，物理电平保留。
+        this.cfg.set(cfg.id, { ...cfg, mode: e.mode! });
+        break;
+      }
+    }
+  }
+
+  private enter(id: string, tick: number): void {
+    const cfg = this.cfg.get(id)!;
+    const target = this.pending.find((p2) => p2.lineId === id)!;
+    this.pending.splice(this.pending.indexOf(target), 1);
+    this.stack.push({
+      lineId: id,
+      total: cfg.handlerTicks,
+      elapsed: 0,
+      enteredAt: tick,
+      entryPriority: cfg.priority,
+      entryMode: cfg.mode,
+      preempted: false,
+    });
+    this.running.add(id);
+  }
+
   /** 只推进一个 tick；结束后返回 null。 */
   step1(): RefSnapshot | null {
     if (this.t >= 500 || !this.alive()) return null;
@@ -87,41 +161,14 @@ export class ReferenceMachine {
     for (const e of this.evs[tick] ?? []) {
       const cfg = this.cfg.get(e.lineId)!;
       if (cfg.mode === 'edge' && e.kind === 'lower') continue;
-      const p = this.pending.find((x) => x.lineId === e.lineId);
-      if (e.kind === 'raise') {
-        if (cfg.mode === 'edge') {
-          if (p) p.hits++;
-          else this.pending.push({ lineId: cfg.id, since: tick, hits: 1, kind: 'edge' });
-        } else {
-          this.level.add(cfg.id);
-          if (!this.masked.has(cfg.id) && !this.running.has(cfg.id) && !p) {
-            this.pending.push({ lineId: cfg.id, since: tick, hits: 1, kind: 'level' });
-          }
-        }
-      } else if (e.kind === 'lower') {
-        this.level.delete(cfg.id);
-        if (!this.running.has(cfg.id)) {
-          const i = this.pending.findIndex((x) => x.lineId === cfg.id && x.kind === 'level');
-          if (i >= 0) this.pending.splice(i, 1);
-        }
-      } else if (e.kind === 'mask') {
-        this.masked.add(cfg.id);
-        if (cfg.mode === 'level' && !this.running.has(cfg.id)) {
-          const i = this.pending.findIndex((x) => x.lineId === cfg.id && x.kind === 'level');
-          if (i >= 0) this.pending.splice(i, 1);
-        }
-      } else if (e.kind === 'unmask') {
-        this.masked.delete(cfg.id);
-        if (
-          cfg.mode === 'level' &&
-          this.level.has(cfg.id) &&
-          !this.running.has(cfg.id) &&
-          !this.pending.some((x) => x.lineId === cfg.id)
-        ) {
-          this.pending.push({ lineId: cfg.id, since: tick, hits: 1, kind: 'level' });
-        }
-      }
-      eventsApplied.push({ lineId: e.lineId, kind: e.kind });
+      this.apply(e, tick);
+      eventsApplied.push(
+        e.kind === 'setPriority'
+          ? { lineId: e.lineId, kind: e.kind, priority: e.priority }
+          : e.kind === 'setMode'
+            ? { lineId: e.lineId, kind: e.kind, mode: e.mode }
+            : { lineId: e.lineId, kind: e.kind }
+      );
     }
 
     // ---- 阶段 B：上一 tick 的完成 ----
@@ -138,31 +185,25 @@ export class ReferenceMachine {
         !this.masked.has(cfg.id) &&
         !this.pending.some((x) => x.lineId === cfg.id)
       ) {
-        this.pending.push({ lineId: cfg.id, since: tick, hits: 1, kind: 'level' });
+        this.pending.push({ lineId: cfg.id, since: tick, hits: 1, origin: 'level' });
       }
       const parent = this.stack[this.stack.length - 1];
       if (parent) parent.preempted = true;
     }
 
-    // ---- 阶段 C：调度 ----
+    // ---- 阶段 C：调度（等待者用当前优先级，帧门槛用进入时冻结值）----
     const runnable = this.orderedRunnable();
     const win = runnable[0];
     const cur = this.stack[this.stack.length - 1];
     let action: TickRecord['action'];
     if (!cur) {
       if (win) {
-        const target = this.pending.find((p2) => p2.lineId === win.lineId)!;
-        this.pending.splice(this.pending.indexOf(target), 1);
-        this.stack.push({ lineId: win.lineId, total: this.cfg.get(win.lineId)!.handlerTicks, elapsed: 0, enteredAt: tick, preempted: false });
-        this.running.add(win.lineId);
+        this.enter(win.lineId, tick);
         action = { type: 'enter', lineId: win.lineId };
       } else action = { type: 'idle' };
-    } else if (win && this.pri(win.lineId) > this.pri(cur.lineId)) {
+    } else if (win && this.pri(win.lineId) > cur.entryPriority) {
       cur.preempted = true;
-      const target = this.pending.find((p2) => p2.lineId === win.lineId)!;
-      this.pending.splice(this.pending.indexOf(target), 1);
-      this.stack.push({ lineId: win.lineId, total: this.cfg.get(win.lineId)!.handlerTicks, elapsed: 0, enteredAt: tick, preempted: false });
-      this.running.add(win.lineId);
+      this.enter(win.lineId, tick);
       action = { type: 'preempt', by: win.lineId, resumed: cur.lineId };
     } else if (cur.preempted) {
       action = { type: 'resume', lineId: cur.lineId };
@@ -188,6 +229,9 @@ export class ReferenceMachine {
         .sort((a, b) => (a.since !== b.since ? a.since - b.since : a.lineId < b.lineId ? -1 : 1)),
       levelAsserted: [...this.level].sort(),
       masked: [...this.masked].sort(),
+      lineStates: [...this.cfg.values()]
+        .map((l) => ({ lineId: l.id, priority: l.priority, mode: l.mode }))
+        .sort((a, b) => (a.lineId < b.lineId ? -1 : a.lineId > b.lineId ? 1 : 0)),
       topRemaining: exec ? exec.total - exec.elapsed : null,
     };
   }

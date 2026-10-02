@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>中断控制器回放（无硬件）</title>
+    <link rel="stylesheet" href="./dist/styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>中断控制器回放</h1>
+      <span class="sub">纯模拟 · 1～8 条中断线 · 边沿/电平 · 嵌套抢占 · 至多 500 tick</span>
+    </header>
+
+    <div class="layout">
+      <!-- 左：配置与控制 -->
+      <div>
+        <div class="panel">
+          <h2>配置</h2>
+          <label>预置场景</label>
+          <select id="demo"></select>
+          <p class="desc" id="desc"></p>
+
+          <label>中断线（JSON 数组：id / priority / mode=edge|level / handlerTicks / initiallyMasked?）</label>
+          <textarea id="linesJson" rows="9" spellcheck="false"></textarea>
+
+          <label>事件（JSON 数组：at / lineId / kind=raise|lower|mask|unmask）</label>
+          <textarea id="eventsJson" rows="8" spellcheck="false"></textarea>
+
+          <div class="btnrow">
+            <button class="primary" id="load">载入并重放</button>
+            <button id="reset">重置到 tick 0</button>
+          </div>
+          <div class="errors" id="errors"></div>
+          <div class="warn" id="warns"></div>
+          <div class="linechips" id="chips"></div>
+        </div>
+
+        <div class="panel">
+          <h2>逐 tick 控制</h2>
+          <div class="btnrow">
+            <button id="step">单步 +1 tick</button>
+            <button id="step5">推进 +5 tick</button>
+            <button id="runAll">整批跑到静止</button>
+          </div>
+          <p class="hint">
+            顺序固定：每 tick 先应用事件，再处理上一 tick 的完成，然后仅更高优先级待处理线可抢占，最后栈顶执行 1 tick。
+          </p>
+        </div>
+
+        <div class="panel">
+          <h2>当前状态</h2>
+          <p class="desc">
+            当前 tick：<b id="tickNo">0</b> ｜ 栈顶剩余：<b id="remaining">—</b>
+          </p>
+          <div class="stackview" id="stackView"></div>
+          <div class="stategrid">
+            <div class="box">
+              <h3>待处理位（since / 合并次数）</h3>
+              <div id="pendingBox"></div>
+            </div>
+            <div class="box">
+              <h3>有效电平</h3>
+              <div id="levelBox"></div>
+            </div>
+            <div class="box">
+              <h3>屏蔽中</h3>
+              <div id="maskBox"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右：同一轨迹的三种视图 -->
+      <div>
+        <div class="panel">
+          <h2>执行时间轴（与下表引用同一轨迹，点击格子联动）</h2>
+          <div class="legend">
+            <span><i style="background:var(--enter)"></i>进入</span>
+            <span><i style="background:var(--preempt)"></i>抢占</span>
+            <span><i style="background:var(--resume)"></i>恢复</span>
+            <span><i style="background:var(--continue)"></i>执行中</span>
+            <span><i style="background:var(--idle)"></i>空闲</span>
+            <span>▶ 栈顶执行 ｜ ∥ 被抢占挂起 ｜ ■ 完成 ｜ P 待处理（数字为合并次数）｜ ~ 电平有效</span>
+            <span>▲ raise ｜ ▼ lower ｜ ⛔ mask ｜ ✓ unmask</span>
+          </div>
+          <div class="warn" id="trunc" style="display:none"></div>
+          <div class="tabs">
+            <button class="active" data-view="timeline">时间轴</button>
+            <button data-view="table">逐 tick 表格</button>
+            <button data-view="logs">执行 / 事件日志</button>
+          </div>
+          <div id="viewTimeline"><div id="timeline"></div></div>
+          <div id="viewTable" style="display:none"></div>
+          <div id="viewLogs" style="display:none"></div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

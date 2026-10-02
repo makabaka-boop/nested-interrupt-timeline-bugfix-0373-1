@@ -193,6 +193,79 @@ describe('屏蔽正在运行的线：当前处理程序跑完；屏蔽期边沿�
     eq(actions(trace), ['enter:K', 'cont:K', 'idle'], '屏蔽不打断 K；解除屏蔽不会补出边沿');
 });
 // ---------------------------------------------------------------------------
+// 场景 8：setMode 边沿→电平 —— 旧模式遗留的待处理位失效，不凭旧位进入
+// ---------------------------------------------------------------------------
+describe('模式切换：边沿屏蔽期合并的待处理位在切成电平时丢弃', () => {
+    const lines = [{ id: 'E', priority: 1, mode: 'edge', handlerTicks: 1 }];
+    const events = [
+        { at: 1, lineId: 'E', kind: 'mask' },
+        { at: 2, lineId: 'E', kind: 'raise' },
+        { at: 3, lineId: 'E', kind: 'raise' },
+        { at: 3, lineId: 'E', kind: 'raise' },
+        { at: 4, lineId: 'E', kind: 'setMode', mode: 'level' },
+        { at: 4, lineId: 'E', kind: 'unmask' },
+        { at: 6, lineId: 'E', kind: 'raise' },
+        { at: 8, lineId: 'E', kind: 'lower' },
+    ];
+    const trace = runReplay(lines, events);
+    eq(trace.ticks[2].pending, [{ lineId: 'E', since: 2, hits: 3, kind: 'edge' }], 'tick3 末：屏蔽期 3 次触发合并为 1 个边沿位');
+    eq(trace.ticks[3].pending, [], 'tick4 切成电平模式：旧边沿待处理位被丢弃');
+    eq(trace.ticks[3].levelAsserted, [], 'tick4 末：无已记电平（解除屏蔽不合成输入）');
+    eq(actions(trace), ['idle', 'idle', 'idle', 'idle', 'idle', 'enter:E', 'enter:E', 'idle'], '旧待处理位不被执行；t6 拉高电平后才按电平语义进入并重入');
+    eq(completes(trace), [[7, 'E'], [8, 'E']], '电平保持有效时完成即重入，lower 后停止');
+});
+// ---------------------------------------------------------------------------
+// 场景 9：setMode 电平→边沿（运行中）—— 处理程序跑完，已记电平失效，不重入
+// ---------------------------------------------------------------------------
+describe('模式切换：运行中的电平线切成边沿，处理程序继续完成且不重入', () => {
+    const lines = [{ id: 'L', priority: 1, mode: 'level', handlerTicks: 2 }];
+    const events = [
+        { at: 1, lineId: 'L', kind: 'raise' },
+        { at: 2, lineId: 'L', kind: 'setMode', mode: 'edge' },
+    ];
+    const trace = runReplay(lines, events);
+    eq(actions(trace), ['enter:L', 'cont:L', 'idle'], '切换模式不杀运行中的处理程序');
+    eq(completes(trace), [[3, 'L']], 't3 正常完成');
+    eq(trace.ticks[1].levelAsserted, [], '切成边沿时已记电平失效（不合成边沿、不留证据）');
+    eq(trace.ticks[2].pending, [], '完成后不重入（当前为边沿模式且无新触发）');
+});
+// ---------------------------------------------------------------------------
+// 场景 10：setPriority 调低运行中的线 —— 严格更高的等待线当 tick 抢占
+// ---------------------------------------------------------------------------
+describe('调级：运行中线被调低后，等待中的高优先级线当 tick 抢占', () => {
+    const lines = [
+        { id: 'A', priority: 3, mode: 'edge', handlerTicks: 4 },
+        { id: 'B', priority: 2, mode: 'edge', handlerTicks: 1 },
+    ];
+    const events = [
+        { at: 1, lineId: 'A', kind: 'raise' },
+        { at: 2, lineId: 'B', kind: 'raise' },
+        { at: 3, lineId: 'A', kind: 'setPriority', priority: 1 },
+    ];
+    const trace = runReplay(lines, events);
+    eq(actions(trace), ['enter:A', 'cont:A', 'preempt:B>A', 'resume:A', 'cont:A', 'idle'], 't3 调低 A 至 1 后，B(2) 当 tick 即可抢占；A 之后恢复并跑完');
+    eq(completes(trace), [[4, 'B'], [6, 'A']], 'B 先完成，A 恢复后完成（被抢占比特不计耗时）');
+    const preemptLogs = trace.logs.filter((l) => l.type === 'preempt');
+    eq(preemptLogs.length, 1, '日志中恰有一次抢占记录');
+    ok(preemptLogs[0]?.tick === 3 && preemptLogs[0]?.detail.includes('优先级 2') && preemptLogs[0]?.detail.includes('优先级 1'), '抢占日志与调度决策使用同一组（当前）优先级，不再互相矛盾');
+});
+// ---------------------------------------------------------------------------
+// 场景 10b：setPriority 调到与等待线相同 —— 同优先级仍不抢占
+// ---------------------------------------------------------------------------
+describe('调级：调到相同优先级仍不抢占（严格更高门槛）', () => {
+    const lines = [
+        { id: 'A', priority: 3, mode: 'edge', handlerTicks: 3 },
+        { id: 'B', priority: 2, mode: 'edge', handlerTicks: 1 },
+    ];
+    const events = [
+        { at: 1, lineId: 'A', kind: 'raise' },
+        { at: 2, lineId: 'B', kind: 'raise' },
+        { at: 3, lineId: 'A', kind: 'setPriority', priority: 2 },
+    ];
+    const trace = runReplay(lines, events);
+    eq(actions(trace), ['enter:A', 'cont:A', 'cont:A', 'enter:B', 'idle'], 'A 调到与 B 相同的 2：同优先级不抢占，A 跑完后 B 才进入');
+});
+// ---------------------------------------------------------------------------
 // 交叉核对：不同批次推进 vs 参考状态机（逐 tick）
 // ---------------------------------------------------------------------------
 function normalize(rec) {
@@ -268,6 +341,30 @@ describe('不同批次推进 ↔ 逐 tick 参考状态机（固定场景）', ()
         { at: 4, lineId: 'Y', kind: 'lower' },
         { at: 5, lineId: 'Y', kind: 'raise' },
     ]);
+    crossCheck('模式切换 + 调级抢占', [
+        { id: 'E', priority: 1, mode: 'edge', handlerTicks: 1 },
+        { id: 'A', priority: 3, mode: 'edge', handlerTicks: 4 },
+        { id: 'B', priority: 2, mode: 'edge', handlerTicks: 1 },
+    ], [
+        { at: 1, lineId: 'E', kind: 'mask' },
+        { at: 1, lineId: 'A', kind: 'raise' },
+        { at: 2, lineId: 'E', kind: 'raise' },
+        { at: 2, lineId: 'B', kind: 'raise' },
+        { at: 3, lineId: 'A', kind: 'setPriority', priority: 1 },
+        { at: 4, lineId: 'E', kind: 'setMode', mode: 'level' },
+        { at: 4, lineId: 'E', kind: 'unmask' },
+    ]);
+    crossCheck('运行中切模式（电平→边沿）', [
+        { id: 'L', priority: 2, mode: 'level', handlerTicks: 3 },
+        { id: 'K', priority: 1, mode: 'edge', handlerTicks: 1 },
+    ], [
+        { at: 1, lineId: 'L', kind: 'raise' },
+        { at: 2, lineId: 'L', kind: 'setMode', mode: 'edge' },
+        { at: 3, lineId: 'K', kind: 'raise' },
+        { at: 5, lineId: 'L', kind: 'raise' },
+        { at: 6, lineId: 'L', kind: 'setMode', mode: 'level' },
+        { at: 7, lineId: 'L', kind: 'raise' },
+    ]);
 });
 // ---------------------------------------------------------------------------
 // 模糊测试：确定性 PRNG，参考机核对 200 个随机场景
@@ -284,7 +381,7 @@ function mulberry32(seed) {
 }
 describe('模糊测试：200 个随机场景，逐状态对齐参考机', () => {
     const rand = mulberry32(20261001);
-    const kinds = ['raise', 'lower', 'mask', 'unmask'];
+    const kinds = ['raise', 'lower', 'mask', 'unmask', 'setPriority', 'setMode'];
     let mismatch = 0;
     for (let it = 0; it < 200; it++) {
         const n = 1 + Math.floor(rand() * 8);
@@ -297,11 +394,19 @@ describe('模糊测试：200 个随机场景，逐状态对齐参考机', () => 
             initiallyMasked: rand() < 0.15,
         }));
         const evCount = Math.floor(rand() * 24);
-        const events = Array.from({ length: evCount }, () => ({
-            at: 1 + Math.floor(rand() * 30),
-            lineId: ids[Math.floor(rand() * n)],
-            kind: kinds[Math.floor(rand() * kinds.length)],
-        }));
+        const events = Array.from({ length: evCount }, () => {
+            const kind = kinds[Math.floor(rand() * kinds.length)];
+            const ev = {
+                at: 1 + Math.floor(rand() * 30),
+                lineId: ids[Math.floor(rand() * n)],
+                kind,
+            };
+            if (kind === 'setPriority')
+                ev.priority = 1 + Math.floor(rand() * 4);
+            if (kind === 'setMode')
+                ev.mode = rand() < 0.5 ? 'edge' : 'level';
+            return ev;
+        });
         const ref = new ReferenceMachine(lines, events);
         const refRecs = [];
         let rr = ref.step1();

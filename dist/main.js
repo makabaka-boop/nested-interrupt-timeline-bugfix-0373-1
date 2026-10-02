@@ -50,7 +50,6 @@ function validateInput(lines, events) {
 }
 var ReplayController = class {
   constructor(lines, events, warnings = []) {
-    this.entryPriority = /* @__PURE__ */ new Map();
     this.lastTick = 0;
     this.truncated = false;
     this.logs = [];
@@ -164,6 +163,12 @@ var ReplayController = class {
         break;
       }
       case "setMode": {
+        if (ev.mode !== line.mode) {
+          for (let i = pending.length - 1; i >= 0; i--) {
+            if (pending[i].lineId === line.id) pending.splice(i, 1);
+          }
+          levelAsserted.delete(line.id);
+        }
         cfg.set(line.id, { ...line, mode: ev.mode });
         break;
       }
@@ -206,7 +211,6 @@ var ReplayController = class {
     if (top && top.elapsed >= top.total) {
       this.state.stack.pop();
       this.state.runningIds.delete(top.lineId);
-      this.entryPriority.delete(top.lineId);
       completed = { lineId: top.lineId };
       this.logs.push({
         tick,
@@ -232,7 +236,7 @@ var ReplayController = class {
       } else {
         action = { type: "idle" };
       }
-    } else if (winner && this.state.cfg.get(winner.lineId).priority > this.entryPriority.get(currentTop.lineId)) {
+    } else if (winner && this.state.cfg.get(winner.lineId).priority > this.state.cfg.get(currentTop.lineId).priority) {
       currentTop.preempted = true;
       this.enterFrame(winner, tick);
       action = { type: "preempt", by: winner.lineId, resumed: currentTop.lineId };
@@ -304,7 +308,6 @@ var ReplayController = class {
       preempted: false
     });
     this.state.runningIds.add(p.lineId);
-    this.entryPriority.set(p.lineId, cfg.priority);
   }
 };
 function eventLabel(kind) {
@@ -389,6 +392,24 @@ var DEMOS = [
       { at: 7, lineId: "L", kind: "mask" },
       { at: 9, lineId: "L", kind: "unmask" },
       { at: 10, lineId: "L", kind: "lower" }
+    ]
+  },
+  {
+    name: "\u6A21\u5F0F\u5207\u6362 + \u8FD0\u884C\u4E2D\u8C03\u7EA7",
+    description: "E \u5C4F\u853D\u671F\u5408\u5E76\u7684\u8FB9\u6CBF\u5F85\u5904\u7406\u4F4D\u5728\u5207\u6210\u7535\u5E73\u6A21\u5F0F\u65F6\u5931\u6548\uFF08\u4E0D\u51ED\u65E7\u4F4D\u8FDB\u5165\uFF09\uFF1BA \u8FD0\u884C\u4E2D\u88AB\u8C03\u4F4E\u4F18\u5148\u7EA7\u540E\uFF0C\u7B49\u5F85\u4E2D\u7684 B \u5F53 tick \u5373\u53EF\u62A2\u5360\u3002",
+    lines: [
+      { id: "E", priority: 1, mode: "edge", handlerTicks: 1 },
+      { id: "A", priority: 3, mode: "edge", handlerTicks: 4 },
+      { id: "B", priority: 2, mode: "edge", handlerTicks: 1 }
+    ],
+    events: [
+      { at: 1, lineId: "E", kind: "mask" },
+      { at: 1, lineId: "A", kind: "raise" },
+      { at: 2, lineId: "E", kind: "raise" },
+      { at: 2, lineId: "B", kind: "raise" },
+      { at: 3, lineId: "A", kind: "setPriority", priority: 1 },
+      { at: 4, lineId: "E", kind: "setMode", mode: "level" },
+      { at: 4, lineId: "E", kind: "unmask" }
     ]
   }
 ];
@@ -652,7 +673,9 @@ function renderTable() {
   }
   let html = '<table class="records"><tr><th>tick</th><th>\u4E8B\u4EF6(\u9636\u6BB5A)</th><th>\u5B8C\u6210(\u9636\u6BB5B)</th><th>\u52A8\u4F5C(\u9636\u6BB5C/D)</th><th>\u6267\u884C\u6808\uFF08\u5E95\u2192\u9876\uFF09</th><th>\u5F85\u5904\u7406\u8BC1\u636E</th></tr>';
   for (const r of controller.ticks) {
-    const evs = r.eventsApplied.length ? r.eventsApplied.map((e) => `<span class="tag event">${e.lineId}\xB7${eventZh(e.kind)}</span>`).join(" ") : '<span class="mono2">\u2014</span>';
+    const evs = r.eventsApplied.length ? r.eventsApplied.map(
+      (e) => `<span class="tag event">${e.lineId}\xB7${eventZh(e.kind)}${e.kind === "setPriority" ? `\u2192p${e.priority}` : e.kind === "setMode" ? `\u2192${e.mode === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"}` : ""}</span>`
+    ).join(" ") : '<span class="mono2">\u2014</span>';
     const comp = r.completed ? `<span class="tag complete">${r.completed.lineId} \u5B8C\u6210</span>` : '<span class="mono2">\u2014</span>';
     let actionDesc;
     if (r.action.type === "preempt")
@@ -697,7 +720,20 @@ function renderLogs() {
   });
 }
 function eventZh(k) {
-  return k === "raise" ? "\u89E6\u53D1/\u62C9\u9AD8" : k === "lower" ? "\u64A4\u9500\u7535\u5E73" : k === "mask" ? "\u5C4F\u853D" : "\u89E3\u9664\u5C4F\u853D";
+  switch (k) {
+    case "raise":
+      return "\u89E6\u53D1/\u62C9\u9AD8";
+    case "lower":
+      return "\u64A4\u9500\u7535\u5E73";
+    case "mask":
+      return "\u5C4F\u853D";
+    case "unmask":
+      return "\u89E3\u9664\u5C4F\u853D";
+    case "setPriority":
+      return "\u8C03\u4F18\u5148\u7EA7";
+    case "setMode":
+      return "\u5207\u6A21\u5F0F";
+  }
 }
 function logZh(t) {
   return { enter: "\u8FDB\u5165", preempt: "\u62A2\u5360", resume: "\u6062\u590D", continue: "\u6267\u884C", complete: "\u5B8C\u6210", event: "\u4E8B\u4EF6", idle: "\u7A7A\u95F2" }[t] ?? t;

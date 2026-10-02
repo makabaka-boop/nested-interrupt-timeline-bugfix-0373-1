@@ -15,6 +15,12 @@
  *  - 电平线：输入保持有效且未屏蔽时即为可运行；处理完成后电平仍有效
  *    则再次进入；屏蔽只阻止调度，不撤销输入电平。
  *  - 屏蔽正在运行的线不会停止其当前处理程序；屏蔽只影响调度资格。
+ *  - setPriority 在阶段 A 立即生效：抢占判断使用双方「当前」优先级，
+ *    因此调低运行中线的优先级后，严格更高的等待线当 tick 即可抢占
+ *    （运行中的处理程序本身不会被打断杀掉，只在阶段 C 让出）。
+ *  - setMode 真正切换模式时，旧模式遗留的触发状态全部失效：丢弃该线
+ *    的待处理位；切到边沿时同时忘掉已记电平（不合成边沿，与 unmask
+ *    不合成边沿同理）。运行中的处理程序不受模式切换影响，继续完成。
  */
 
 import {
@@ -93,7 +99,6 @@ interface InternalState {
 /** 逐 tick 推进器：同一状态机既支持单步也支持整批回放。 */
 export class ReplayController {
   private state: InternalState;
-  private entryPriority = new Map<string, number>();
   private eventsByTick: Map<number, ScheduledEvent[]>;
   private lastTick = 0;
   private truncated = false;
@@ -237,6 +242,15 @@ export class ReplayController {
         break;
       }
       case 'setMode': {
+        if (ev.mode !== line.mode) {
+          // 真正切换模式：旧模式遗留的触发状态失效 —— 丢弃待处理位，
+          // 并忘掉已记电平（切到边沿不会把保持的电平合成边沿；
+          // 切到电平时本线也不可能有已记电平）。运行中的帧不受影响。
+          for (let i = pending.length - 1; i >= 0; i--) {
+            if (pending[i].lineId === line.id) pending.splice(i, 1);
+          }
+          levelAsserted.delete(line.id);
+        }
         cfg.set(line.id, { ...line, mode: ev.mode! });
         break;
       }
@@ -294,7 +308,6 @@ export class ReplayController {
     if (top && top.elapsed >= top.total) {
       this.state.stack.pop()!;
       this.state.runningIds.delete(top.lineId);
-      this.entryPriority.delete(top.lineId);
       completed = { lineId: top.lineId };
       this.logs.push({
         tick,
@@ -336,9 +349,11 @@ export class ReplayController {
     } else if (
       winner &&
       this.state.cfg.get(winner.lineId)!.priority >
-        this.entryPriority.get(currentTop.lineId)!
+        this.state.cfg.get(currentTop.lineId)!.priority
     ) {
       // 仅严格更高优先级可抢占当前程序；同优先级即使等待也不动。
+      // 比较用双方「当前」优先级：setPriority 在阶段 A 生效后，
+      // 本 tick 的抢占判断即按新优先级执行。
       currentTop.preempted = true;
       this.enterFrame(winner, tick);
       action = { type: 'preempt', by: winner.lineId, resumed: currentTop.lineId };
@@ -421,7 +436,6 @@ export class ReplayController {
       preempted: false,
     });
     this.state.runningIds.add(p.lineId);
-    this.entryPriority.set(p.lineId, cfg.priority);
   }
 }
 

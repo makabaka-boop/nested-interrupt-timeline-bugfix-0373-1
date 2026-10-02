@@ -324,7 +324,14 @@ function renderTable(): void {
   let html = '<table class="records"><tr><th>tick</th><th>事件(阶段A)</th><th>完成(阶段B)</th><th>动作(阶段C/D)</th><th>执行栈（底→顶）</th><th>待处理证据</th></tr>';
   for (const r of controller.ticks) {
     const evs = r.eventsApplied.length
-      ? r.eventsApplied.map((e) => `<span class="tag event">${e.lineId}·${eventZh(e.kind)}</span>`).join(' ')
+      ? r.eventsApplied
+          .map(
+            (e) =>
+              `<span class="tag event">${e.lineId}·${eventZh(e.kind)}${
+                e.kind === 'setPriority' ? `→p${e.priority}` : e.kind === 'setMode' ? `→${e.mode === 'edge' ? '边沿' : '电平'}` : ''
+              }</span>`
+          )
+          .join(' ')
       : '<span class="mono2">—</span>';
     const comp = r.completed ? `<span class="tag complete">${r.completed.lineId} 完成</span>` : '<span class="mono2">—</span>';
     let actionDesc: string;
@@ -381,7 +388,20 @@ function renderLogs(): void {
 }
 
 function eventZh(k: ScheduledEvent['kind']): string {
-  return k === 'raise' ? '触发/拉高' : k === 'lower' ? '撤销电平' : k === 'mask' ? '屏蔽' : '解除屏蔽';
+  switch (k) {
+    case 'raise':
+      return '触发/拉高';
+    case 'lower':
+      return '撤销电平';
+    case 'mask':
+      return '屏蔽';
+    case 'unmask':
+      return '解除屏蔽';
+    case 'setPriority':
+      return '调优先级';
+    case 'setMode':
+      return '切模式';
+  }
 }
 function logZh(t: string): string {
   return (

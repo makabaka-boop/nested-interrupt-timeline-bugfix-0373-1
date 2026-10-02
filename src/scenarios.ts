@@ -63,4 +63,23 @@ export const DEMOS: Demo[] = [
       { at: 10, lineId: 'L', kind: 'lower' },
     ],
   },
+  {
+    name: '模式切换 + 运行中调级',
+    description:
+      'E 屏蔽期合并的边沿待处理位在切成电平模式时失效（不凭旧位进入）；A 运行中被调低优先级后，等待中的 B 当 tick 即可抢占。',
+    lines: [
+      { id: 'E', priority: 1, mode: 'edge', handlerTicks: 1 },
+      { id: 'A', priority: 3, mode: 'edge', handlerTicks: 4 },
+      { id: 'B', priority: 2, mode: 'edge', handlerTicks: 1 },
+    ],
+    events: [
+      { at: 1, lineId: 'E', kind: 'mask' },
+      { at: 1, lineId: 'A', kind: 'raise' },
+      { at: 2, lineId: 'E', kind: 'raise' },
+      { at: 2, lineId: 'B', kind: 'raise' },
+      { at: 3, lineId: 'A', kind: 'setPriority', priority: 1 },
+      { at: 4, lineId: 'E', kind: 'setMode', mode: 'level' },
+      { at: 4, lineId: 'E', kind: 'unmask' },
+    ],
+  },
 ];

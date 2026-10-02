@@ -18,7 +18,7 @@ interface RefFrame {
 
 interface RefSnapshot {
   tick: number;
-  eventsApplied: Array<{ lineId: string; kind: ScheduledEvent['kind'] }>;
+  eventsApplied: TickRecord['eventsApplied'];
   completed?: { lineId: string };
   action: TickRecord['action'];
   stack: RefFrame[];
@@ -120,8 +120,25 @@ export class ReferenceMachine {
         ) {
           this.pending.push({ lineId: cfg.id, since: tick, hits: 1, kind: 'level' });
         }
+      } else if (e.kind === 'setPriority') {
+        this.cfg.set(cfg.id, { ...cfg, priority: e.priority! });
+      } else if (e.kind === 'setMode') {
+        if (e.mode !== cfg.mode) {
+          // 真正切换模式：旧模式遗留的待处理位与已记电平一并失效。
+          for (let i = this.pending.length - 1; i >= 0; i--) {
+            if (this.pending[i].lineId === cfg.id) this.pending.splice(i, 1);
+          }
+          this.level.delete(cfg.id);
+        }
+        this.cfg.set(cfg.id, { ...cfg, mode: e.mode! });
       }
-      eventsApplied.push({ lineId: e.lineId, kind: e.kind });
+      eventsApplied.push(
+        e.kind === 'setPriority'
+          ? { lineId: e.lineId, kind: e.kind, priority: e.priority }
+          : e.kind === 'setMode'
+            ? { lineId: e.lineId, kind: e.kind, mode: e.mode }
+            : { lineId: e.lineId, kind: e.kind }
+      );
     }
 
     // ---- 阶段 B：上一 tick 的完成 ----

@@ -15,6 +15,12 @@
  *  - 电平线：输入保持有效且未屏蔽时即为可运行；处理完成后电平仍有效
  *    则再次进入；屏蔽只阻止调度，不撤销输入电平。
  *  - 屏蔽正在运行的线不会停止其当前处理程序；屏蔽只影响调度资格。
+ *  - setPriority 在阶段 A 立即生效：抢占判断使用双方「当前」优先级，
+ *    因此调低运行中线的优先级后，严格更高的等待线当 tick 即可抢占
+ *    （运行中的处理程序本身不会被打断杀掉，只在阶段 C 让出）。
+ *  - setMode 真正切换模式时，旧模式遗留的触发状态全部失效：丢弃该线
+ *    的待处理位；切到边沿时同时忘掉已记电平（不合成边沿，与 unmask
+ *    不合成边沿同理）。运行中的处理程序不受模式切换影响，继续完成。
  */
 import { comparePending, MAX_TICKS, } from './model.js';
 /** 校验配置与事件，返回告警/错误。 */
@@ -49,6 +55,12 @@ export function validateInput(lines, events) {
         }
         if (ev.at > MAX_TICKS) {
             warnings.push(`tick ${ev.at} 超出 ${MAX_TICKS} tick 回放窗口，该事件永远不会被应用。`);
+        }
+        if (ev.kind === 'setPriority' && !Number.isInteger(ev.priority)) {
+            errors.push(`tick ${ev.at} 的优先级调整缺少整数 priority：${ev.lineId}`);
+        }
+        if (ev.kind === 'setMode' && ev.mode !== 'edge' && ev.mode !== 'level') {
+            errors.push(`tick ${ev.at} 的模式调整必须指定 edge 或 level：${ev.lineId}`);
         }
         const cfg = lines.find((l) => l.id === ev.lineId);
         if (cfg?.mode === 'edge' && ev.kind === 'lower') {
@@ -191,6 +203,24 @@ export class ReplayController {
                 }
                 break;
             }
+            case 'setPriority': {
+                cfg.set(line.id, { ...line, priority: ev.priority });
+                break;
+            }
+            case 'setMode': {
+                if (ev.mode !== line.mode) {
+                    // 真正切换模式：旧模式遗留的触发状态失效 —— 丢弃待处理位，
+                    // 并忘掉已记电平（切到边沿不会把保持的电平合成边沿；
+                    // 切到电平时本线也不可能有已记电平）。运行中的帧不受影响。
+                    for (let i = pending.length - 1; i >= 0; i--) {
+                        if (pending[i].lineId === line.id)
+                            pending.splice(i, 1);
+                    }
+                    levelAsserted.delete(line.id);
+                }
+                cfg.set(line.id, { ...line, mode: ev.mode });
+                break;
+            }
         }
     }
     // ------------------------------------------------------------------
@@ -224,13 +254,17 @@ export class ReplayController {
             if (cfg.mode === 'edge' && ev.kind === 'lower')
                 continue;
             this.applyEvent(ev, tick);
-            eventsApplied.push({ lineId: ev.lineId, kind: ev.kind });
+            eventsApplied.push(ev.kind === 'setPriority'
+                ? { lineId: ev.lineId, kind: ev.kind, priority: ev.priority }
+                : ev.kind === 'setMode'
+                    ? { lineId: ev.lineId, kind: ev.kind, mode: ev.mode }
+                    : { lineId: ev.lineId, kind: ev.kind });
             this.logs.push({
                 tick,
                 type: 'event',
                 lineId: ev.lineId,
                 eventKind: ev.kind,
-                detail: `tick ${tick} 事件：${ev.lineId} ${eventLabel(ev.kind)}`,
+                detail: `tick ${tick} 事件：${ev.lineId} ${eventLabel(ev.kind)}${ev.kind === 'setPriority' ? ` ${ev.priority}` : ''}`,
             });
         }
         // 阶段 B：处理上一 tick 的完成（栈顶 elapsed 已达 total）。
@@ -277,6 +311,8 @@ export class ReplayController {
             this.state.cfg.get(winner.lineId).priority >
                 this.state.cfg.get(currentTop.lineId).priority) {
             // 仅严格更高优先级可抢占当前程序；同优先级即使等待也不动。
+            // 比较用双方「当前」优先级：setPriority 在阶段 A 生效后，
+            // 本 tick 的抢占判断即按新优先级执行。
             currentTop.preempted = true;
             this.enterFrame(winner, tick);
             action = { type: 'preempt', by: winner.lineId, resumed: currentTop.lineId };
@@ -369,6 +405,10 @@ function eventLabel(kind) {
             return 'mask（屏蔽）';
         case 'unmask':
             return 'unmask（解除屏蔽）';
+        case 'setPriority':
+            return 'setPriority（调整优先级）';
+        case 'setMode':
+            return 'setMode（切换触发模式）';
         default:
             return kind;
     }

@@ -317,6 +317,24 @@ td.ev-unmask::before {
   font-size: 9px;
   color: var(--enter);
 }
+td.ev-setPriority::after {
+  content: 'p';
+  position: absolute;
+  top: -3px;
+  right: 1px;
+  font-size: 8px;
+  font-weight: 700;
+  color: #d7b6ff;
+}
+td.ev-setMode::after {
+  content: 'M';
+  position: absolute;
+  top: -3px;
+  right: 1px;
+  font-size: 8px;
+  font-weight: 700;
+  color: #7ae0d4;
+}
 
 td.cell {
   cursor: pointer;
